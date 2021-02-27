@@ -95,6 +95,31 @@ where
     InternedTree(ret)
 }
 
+/// Intern an owned value using tree map (will not clone)
+pub fn intern_tree<T>(val: T) -> InternedTree<T>
+where
+    T: Ord + Send + Sync + 'static,
+{
+    intern_tree_arc(Arc::new(val))
+}
+
+/// Intern a non-owned reference using tree map (will clone)
+pub fn intern_tree_unsized<T>(val: &T) -> InternedTree<T>
+where
+    T: Ord + Send + Sync + ?Sized + 'static,
+    Arc<T>: for<'a> From<&'a T>,
+{
+    intern_tree_arc(Arc::from(val))
+}
+
+/// Intern an owned reference using tree map (will not clone)
+pub fn intern_tree_boxed<T>(val: Box<T>) -> InternedTree<T>
+where
+    T: Ord + Send + Sync + ?Sized + 'static,
+{
+    intern_tree_arc(Arc::from(val))
+}
+
 /// Perform internal maintenance (removing otherwise unreferenced elements) and return count of elements
 pub fn num_objects_interned_tree<T: Ord + ?Sized + 'static>() -> usize {
     if let Some(m) = CONTAINER_TREE

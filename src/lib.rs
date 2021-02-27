@@ -69,318 +69,186 @@
 #![doc(html_logo_url = "https://developer.actyx.com/img/logo.svg")]
 #![doc(html_favicon_url = "https://developer.actyx.com/img/favicon.ico")]
 
-use dashmap::DashMap;
-use once_cell::sync::OnceCell;
-use std::hash::Hash;
-use std::sync::Arc;
-use std::{
-    any::{Any, TypeId},
-    fmt::Display,
-    ops::Deref,
-};
-
 mod hash;
-mod tree;
+mod ref_count;
+// mod tree;
 
-pub use hash::{inspect_hash, intern_hash_arc, num_objects_interned_hash, InternedHash};
-pub use tree::{inspect_tree, intern_tree_arc, num_objects_interned_tree, InternedTree};
-
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum Interned<T: ?Sized + Eq + Hash + Ord + 'static> {
-    Hash(InternedHash<T>),
-    Tree(InternedTree<T>),
-}
-
-impl<T: ?Sized + Eq + Hash + Ord + 'static> Interned<T> {
-    pub fn references(this: &Self) -> usize {
-        match this {
-            Interned::Hash(h) => InternedHash::references(h),
-            Interned::Tree(t) => InternedTree::references(t),
-        }
-    }
-}
-
-impl<T: ?Sized + Eq + Hash + Ord + 'static + Display> Display for Interned<T> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Interned::Hash(h) => h.fmt(f),
-            Interned::Tree(t) => t.fmt(f),
-        }
-    }
-}
-
-impl<T: ?Sized + Eq + Hash + Ord + 'static> Deref for Interned<T> {
-    type Target = T;
-
-    fn deref(&self) -> &Self::Target {
-        match self {
-            Interned::Hash(h) => h.deref(),
-            Interned::Tree(t) => t.deref(),
-        }
-    }
-}
-
-static CONTAINER_HASH: OnceCell<DashMap<TypeId, Box<dyn Any + Send + Sync>>> = OnceCell::new();
-static CONTAINER_TREE: OnceCell<DashMap<TypeId, Box<dyn Any + Send + Sync>>> = OnceCell::new();
-
-/// Intern an owned value using hashing (will not clone)
-pub fn intern_hash<T>(val: T) -> InternedHash<T>
-where
-    T: Eq + Hash + Send + Sync + 'static,
-{
-    intern_hash_arc(Arc::new(val))
-}
-
-/// Intern a non-owned reference using hashing (will clone)
-pub fn intern_hash_unsized<T>(val: &T) -> InternedHash<T>
-where
-    T: Eq + Hash + Send + Sync + ?Sized + 'static,
-    Arc<T>: for<'a> From<&'a T>,
-{
-    intern_hash_arc(Arc::from(val))
-}
-
-/// Intern an owned reference using hashing (will not clone)
-pub fn intern_hash_boxed<T>(val: Box<T>) -> InternedHash<T>
-where
-    T: Eq + Hash + Send + Sync + ?Sized + 'static,
-{
-    intern_hash_arc(Arc::from(val))
-}
-
-/// Intern an owned value using tree map (will not clone)
-pub fn intern_tree<T>(val: T) -> InternedTree<T>
-where
-    T: Ord + Send + Sync + 'static,
-{
-    intern_tree_arc(Arc::new(val))
-}
-
-/// Intern a non-owned reference using tree map (will clone)
-pub fn intern_tree_unsized<T>(val: &T) -> InternedTree<T>
-where
-    T: Ord + Send + Sync + ?Sized + 'static,
-    Arc<T>: for<'a> From<&'a T>,
-{
-    intern_tree_arc(Arc::from(val))
-}
-
-/// Intern an owned reference using tree map (will not clone)
-pub fn intern_tree_boxed<T>(val: Box<T>) -> InternedTree<T>
-where
-    T: Ord + Send + Sync + ?Sized + 'static,
-{
-    intern_tree_arc(Arc::from(val))
-}
-
-/// Intern an owned value (will not clone)
-pub fn intern<T>(val: T) -> Interned<T>
-where
-    T: Eq + Hash + Ord + Send + Sync + 'static,
-{
-    if std::mem::size_of::<T>() > 1000 {
-        Interned::Tree(intern_tree(val))
-    } else {
-        Interned::Hash(intern_hash(val))
-    }
-}
-
-/// Intern a non-owned reference (will clone)
-pub fn intern_unsized<T: ?Sized>(val: &T) -> Interned<T>
-where
-    T: Eq + Hash + Ord + Send + Sync + 'static,
-    Arc<T>: for<'a> From<&'a T>,
-{
-    if std::mem::size_of_val(val) > 1000 {
-        Interned::Tree(intern_tree_unsized(val))
-    } else {
-        Interned::Hash(intern_hash_unsized(val))
-    }
-}
-
-/// Intern an owned reference (will not clone)
-pub fn intern_boxed<T: ?Sized>(val: Box<T>) -> Interned<T>
-where
-    T: Eq + Hash + Ord + Send + Sync + 'static,
-{
-    if std::mem::size_of_val(val.as_ref()) > 1000 {
-        Interned::Tree(intern_tree_boxed(val))
-    } else {
-        Interned::Hash(intern_hash_boxed(val))
-    }
-}
-
-/// Intern a shared-ownership reference (will not clone)
-///
-/// Returns either the given Arc or an already-interned one pointing to an equivalent value.
-pub fn intern_arc<T: ?Sized>(val: Arc<T>) -> Interned<T>
-where
-    T: Eq + Hash + Ord + Send + Sync + 'static,
-{
-    if std::mem::size_of_val(val.as_ref()) > 1000 {
-        Interned::Tree(intern_tree_arc(val))
-    } else {
-        Interned::Hash(intern_hash_arc(val))
-    }
-}
-
-/// Number of different types (TypeIds) interned using hashing and tree-based, respectively
-pub fn types_interned() -> (usize, usize) {
-    (
-        CONTAINER_HASH.get().map(|m| m.len()).unwrap_or_default(),
-        CONTAINER_TREE.get().map(|m| m.len()).unwrap_or_default(),
-    )
-}
+pub use hash::InternHash;
+pub use ref_count::Interned;
+// pub use tree::InternedTree;
 
 #[cfg(test)]
 mod tests {
     use crate::*;
-    use std::thread;
+    //     use std::thread;
 
     // Test basic functionality.
     #[test]
     fn basic_hash() {
-        assert_eq!(intern_hash("foo"), intern_hash("foo"));
-        assert_ne!(intern_hash("foo"), intern_hash("bar"));
+        let interner = InternHash::<&str>::new();
+
+        assert_eq!(interner.intern_sized("foo"), interner.intern_sized("foo"));
+        assert_ne!(interner.intern_sized("foo"), interner.intern_sized("bar"));
         // The above refs should be deallocated by now.
-        assert_eq!(num_objects_interned_hash::<&str>(), 0);
+        assert_eq!(interner.len(), 0);
 
-        let _interned1 = intern_hash("foo".to_string());
+        let interner = InternHash::<String>::new();
+
+        let interned1 = interner.intern_sized("foo".to_string());
         {
-            let interned2 = intern_hash("foo".to_string());
-            let interned3 = intern_hash("bar".to_string());
+            let interned2 = interner.intern_sized("foo".to_string());
+            let interned3 = interner.intern_sized("bar".to_string());
 
-            assert_eq!(InternedHash::references(&interned2), 3);
-            assert_eq!(InternedHash::references(&interned3), 2);
+            assert_eq!(interned2.ref_count(), 3);
+            assert_eq!(interned3.ref_count(), 2);
             // We now have two unique interned strings: "foo" and "bar".
-            assert_eq!(num_objects_interned_hash::<String>(), 2);
+            assert_eq!(interner.len(), 2);
         }
 
         // "bar" is now gone.
-        assert_eq!(num_objects_interned_hash::<String>(), 1);
+        assert_eq!(interner.len(), 1);
+
+        drop(interner);
+        assert_eq!(interned1.ref_count(), 1);
     }
 
     // Test basic functionality.
     #[test]
     fn basic_hash_unsized() {
-        assert_eq!(intern_hash_unsized("foo"), intern_hash_unsized("foo"));
-        assert_ne!(intern_hash_unsized("foo"), intern_hash_unsized("bar"));
+        let interner = InternHash::<str>::new();
+
+        assert_eq!(interner.intern_ref("foo"), interner.intern_ref("foo"));
+        assert_ne!(interner.intern_ref("foo"), interner.intern_ref("bar"));
         // The above refs should be deallocated by now.
-        assert_eq!(num_objects_interned_hash::<str>(), 0);
+        assert_eq!(interner.len(), 0);
 
-        let _interned1 = intern_hash_unsized("foo");
+        let interned1 = interner.intern_ref("foo");
         {
-            let interned2 = intern_hash_unsized("foo");
-            let interned3 = intern_hash_unsized("bar");
+            let interned2 = interner.intern_ref("foo");
+            let interned3 = interner.intern_ref("bar");
 
-            assert_eq!(InternedHash::references(&interned2), 3);
-            assert_eq!(InternedHash::references(&interned3), 2);
+            assert_eq!(interned2.ref_count(), 3);
+            assert_eq!(interned3.ref_count(), 2);
             // We now have two unique interned strings: "foo" and "bar".
-            assert_eq!(num_objects_interned_hash::<str>(), 2);
+            assert_eq!(interner.len(), 2);
         }
 
         // "bar" is now gone.
-        assert_eq!(num_objects_interned_hash::<str>(), 1);
+        assert_eq!(interner.len(), 1);
+
+        assert_eq!(
+            &*interned1 as *const _,
+            &*interner.intern_ref("foo") as *const _
+        );
+
+        drop(interner);
+
+        assert_ne!(
+            &*interned1 as *const _,
+            &*InternHash::new().intern_ref("foo") as *const _
+        );
+
+        assert_eq!(interned1.ref_count(), 1);
     }
 
-    // Test basic functionality.
-    #[test]
-    fn basic_tree() {
-        assert_eq!(intern_tree("foo"), intern_tree("foo"));
-        assert_ne!(intern_tree("foo"), intern_tree("bar"));
-        // The above refs should be deallocated by now.
-        assert_eq!(num_objects_interned_tree::<&str>(), 0);
+    //     // Test basic functionality.
+    //     #[test]
+    //     fn basic_tree() {
+    //         assert_eq!(intern_tree("foo"), intern_tree("foo"));
+    //         assert_ne!(intern_tree("foo"), intern_tree("bar"));
+    //         // The above refs should be deallocated by now.
+    //         assert_eq!(num_objects_interned_tree::<&str>(), 0);
 
-        let _interned1 = intern_tree("foo".to_string());
-        {
-            let interned2 = intern_tree("foo".to_string());
-            let interned3 = intern_tree("bar".to_string());
+    //         let _interned1 = intern_tree("foo".to_string());
+    //         {
+    //             let interned2 = intern_tree("foo".to_string());
+    //             let interned3 = intern_tree("bar".to_string());
 
-            assert_eq!(InternedTree::references(&interned2), 3);
-            assert_eq!(InternedTree::references(&interned3), 2);
-            // We now have two unique interned strings: "foo" and "bar".
-            assert_eq!(num_objects_interned_tree::<String>(), 2);
-        }
+    //             assert_eq!(InternedTree::references(&interned2), 3);
+    //             assert_eq!(InternedTree::references(&interned3), 2);
+    //             // We now have two unique interned strings: "foo" and "bar".
+    //             assert_eq!(num_objects_interned_tree::<String>(), 2);
+    //         }
 
-        // "bar" is now gone.
-        assert_eq!(num_objects_interned_tree::<String>(), 1);
-    }
+    //         // "bar" is now gone.
+    //         assert_eq!(num_objects_interned_tree::<String>(), 1);
+    //     }
 
-    // Test basic functionality.
-    #[test]
-    fn basic_tree_unsized() {
-        assert_eq!(intern_tree_unsized("foo"), intern_tree_unsized("foo"));
-        assert_ne!(intern_tree_unsized("foo"), intern_tree_unsized("bar"));
-        // The above refs should be deallocated by now.
-        assert_eq!(num_objects_interned_tree::<str>(), 0);
+    //     // Test basic functionality.
+    //     #[test]
+    //     fn basic_tree_unsized() {
+    //         assert_eq!(intern_tree_unsized("foo"), intern_tree_unsized("foo"));
+    //         assert_ne!(intern_tree_unsized("foo"), intern_tree_unsized("bar"));
+    //         // The above refs should be deallocated by now.
+    //         assert_eq!(num_objects_interned_tree::<str>(), 0);
 
-        let _interned1 = intern_tree_unsized("foo");
-        {
-            let interned2 = intern_tree_unsized("foo");
-            let interned3 = intern_tree_unsized("bar");
+    //         let _interned1 = intern_tree_unsized("foo");
+    //         {
+    //             let interned2 = intern_tree_unsized("foo");
+    //             let interned3 = intern_tree_unsized("bar");
 
-            assert_eq!(InternedTree::references(&interned2), 3);
-            assert_eq!(InternedTree::references(&interned3), 2);
-            // We now have two unique interned strings: "foo" and "bar".
-            assert_eq!(num_objects_interned_tree::<str>(), 2);
-        }
+    //             assert_eq!(InternedTree::references(&interned2), 3);
+    //             assert_eq!(InternedTree::references(&interned3), 2);
+    //             // We now have two unique interned strings: "foo" and "bar".
+    //             assert_eq!(num_objects_interned_tree::<str>(), 2);
+    //         }
 
-        // "bar" is now gone.
-        assert_eq!(num_objects_interned_tree::<str>(), 1);
-    }
+    //         // "bar" is now gone.
+    //         assert_eq!(num_objects_interned_tree::<str>(), 1);
+    //     }
 
-    // Ordering should be based on values, not pointers.
-    // Also tests `Display` implementation.
-    #[test]
-    fn sorting() {
-        let mut interned_vals = vec![
-            intern_hash(4),
-            intern_hash(2),
-            intern_hash(5),
-            intern_hash(0),
-            intern_hash(1),
-            intern_hash(3),
-        ];
-        interned_vals.sort();
-        let sorted: Vec<String> = interned_vals.iter().map(|v| format!("{}", v)).collect();
-        assert_eq!(&sorted.join(","), "0,1,2,3,4,5");
-    }
+    //     // Ordering should be based on values, not pointers.
+    //     // Also tests `Display` implementation.
+    //     #[test]
+    //     fn sorting() {
+    //         let mut interned_vals = vec![
+    //             intern_hash(4),
+    //             intern_hash(2),
+    //             intern_hash(5),
+    //             intern_hash(0),
+    //             intern_hash(1),
+    //             intern_hash(3),
+    //         ];
+    //         interned_vals.sort();
+    //         let sorted: Vec<String> = interned_vals.iter().map(|v| format!("{}", v)).collect();
+    //         assert_eq!(&sorted.join(","), "0,1,2,3,4,5");
+    //     }
 
-    #[derive(Eq, PartialEq, Ord, PartialOrd, Hash)]
-    pub struct TestStruct2(String, u64);
+    //     #[derive(Eq, PartialEq, Ord, PartialOrd, Hash)]
+    //     pub struct TestStruct2(String, u64);
 
-    #[test]
-    fn sequential() {
-        for _i in 0..10_000 {
-            let mut interned = Vec::with_capacity(100);
-            for j in 0..100 {
-                interned.push(intern_hash(TestStruct2("foo".to_string(), j)));
-            }
-        }
+    //     #[test]
+    //     fn sequential() {
+    //         for _i in 0..10_000 {
+    //             let mut interned = Vec::with_capacity(100);
+    //             for j in 0..100 {
+    //                 interned.push(intern_hash(TestStruct2("foo".to_string(), j)));
+    //             }
+    //         }
 
-        assert_eq!(num_objects_interned_hash::<TestStruct2>(), 0);
-    }
+    //         assert_eq!(num_objects_interned_hash::<TestStruct2>(), 0);
+    //     }
 
-    #[derive(Eq, PartialEq, Ord, PartialOrd, Hash)]
-    pub struct TestStruct(String, u64);
+    //     #[derive(Eq, PartialEq, Ord, PartialOrd, Hash)]
+    //     pub struct TestStruct(String, u64);
 
-    // Quickly create and destroy a small number of interned objects from
-    // multiple threads.
-    #[test]
-    fn multithreading1() {
-        let mut thandles = vec![];
-        for _i in 0..10 {
-            thandles.push(thread::spawn(|| {
-                for _i in 0..100_000 {
-                    let _interned1 = intern_hash(TestStruct("foo".to_string(), 5));
-                    let _interned2 = intern_hash(TestStruct("bar".to_string(), 10));
-                }
-            }));
-        }
-        for h in thandles.into_iter() {
-            h.join().unwrap()
-        }
+    //     // Quickly create and destroy a small number of interned objects from
+    //     // multiple threads.
+    //     #[test]
+    //     fn multithreading1() {
+    //         let mut thandles = vec![];
+    //         for _i in 0..10 {
+    //             thandles.push(thread::spawn(|| {
+    //                 for _i in 0..100_000 {
+    //                     let _interned1 = intern_hash(TestStruct("foo".to_string(), 5));
+    //                     let _interned2 = intern_hash(TestStruct("bar".to_string(), 10));
+    //                 }
+    //             }));
+    //         }
+    //         for h in thandles.into_iter() {
+    //             h.join().unwrap()
+    //         }
 
-        assert_eq!(num_objects_interned_hash::<TestStruct>(), 0);
-    }
+    //         assert_eq!(num_objects_interned_hash::<TestStruct>(), 0);
+    //     }
 }
