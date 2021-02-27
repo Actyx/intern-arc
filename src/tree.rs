@@ -54,6 +54,14 @@ fn remove_if_last<T: ?Sized + Ord>(this: *const (), key: &Interned<T>) -> Remova
     }
 }
 
+/// Interner for values with a total order
+///
+/// The interner is cheaply cloneable by virtue of keeping the underlying storage
+/// in an [`Arc`](https://doc.rust-lang.org/std/sync/struct.Arc.html). Once the last
+/// reference to this interner is dropped, it will clear its backing storage and
+/// release all references to the interned values it has created that are still live.
+/// Those values remain fully operational until dropped. Memory for the values
+/// themselves is freed for each value individually once its last reference is dropped.
 impl<T: ?Sized + Ord> InternOrd<T> {
     pub fn new() -> Self {
         Self {
@@ -68,10 +76,12 @@ impl<T: ?Sized + Ord> InternOrd<T> {
         self.inner.map.lock()
     }
 
+    /// Returns the number of objects currently kept in this interner.
     pub fn len(&self) -> usize {
         self.map().len()
     }
 
+    /// Returns `true` when this interner doesn’t hold any values.
     pub fn is_empty(&self) -> bool {
         self.map().is_empty()
     }
@@ -88,6 +98,14 @@ impl<T: ?Sized + Ord> InternOrd<T> {
         ret
     }
 
+    /// Intern a value from a shared reference by allocating new memory for it.
+    ///
+    /// ```
+    /// use intern_arc::{InternOrd, Interned};
+    ///
+    /// let strings = InternOrd::<str>::new();
+    /// let i: Interned<str> = strings.intern_ref("hello world!");
+    /// ```
     pub fn intern_ref(&self, value: &T) -> Interned<T>
     where
         T: ToOwned,
@@ -100,6 +118,16 @@ impl<T: ?Sized + Ord> InternOrd<T> {
         self.intern(map, Interned::from_box(value.to_owned().into()))
     }
 
+    /// Intern a value from an owned reference without allocating new memory for it.
+    ///
+    /// ```
+    /// use intern_arc::{InternOrd, Interned};
+    ///
+    /// let strings = InternOrd::<str>::new();
+    /// let hello: Box<str> = "hello world!".into();
+    /// let i: Interned<str> = strings.intern_box(hello);
+    /// ```
+    /// (This also works nicely with a `String` that can be turned `.into()` a `Box`.)
     pub fn intern_box(&self, value: Box<T>) -> Interned<T> {
         let map = self.map();
         if let Some(entry) = map.get(value.as_ref()) {
@@ -108,6 +136,13 @@ impl<T: ?Sized + Ord> InternOrd<T> {
         self.intern(map, Interned::from_box(value))
     }
 
+    /// Intern a sized value, allocating heap memory for it.
+    ///
+    /// ```
+    /// use intern_arc::{InternOrd, Interned};
+    ///
+    /// let arrays = InternOrd::<[u8; 1000]>::new();
+    /// let i: Interned<[u8; 1000]> = arrays.intern_sized([0; 1000]);
     pub fn intern_sized(&self, value: T) -> Interned<T>
     where
         T: Sized,

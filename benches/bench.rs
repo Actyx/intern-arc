@@ -1,50 +1,106 @@
 use criterion::{criterion_group, criterion_main, BatchSize, Criterion};
-use intern_arc::{Intern, Interned};
+use intern_arc::{InternHash, InternOrd};
+use quickcheck::{Arbitrary, Gen};
 
-fn intern_hello(interner: &Intern<str>) -> Interned<str> {
-    interner.intern_ref("hello")
-}
-
-fn intern_and_drop(interner: &Intern<str>) {
-    interner.intern_ref("hello");
+fn large(size: usize) -> Vec<u8> {
+    Arbitrary::arbitrary(&mut Gen::new(size))
 }
 
 fn hash(c: &mut Criterion) {
     let mut c = c.benchmark_group("hash");
+
     c.bench_function("intern fresh", |b| {
         b.iter_batched_ref(
-            Intern::<str>::new,
-            |i| intern_hello(i),
+            InternHash::<str>::new,
+            |i| i.intern_ref("hello"),
             BatchSize::SmallInput,
         )
     });
     c.bench_function("intern known", |b| {
         b.iter_batched_ref(
             || {
-                let i = Intern::<str>::new();
+                let i = InternHash::<str>::new();
                 i.intern_ref("hello");
                 i
             },
-            |i| intern_hello(i),
+            |i| i.intern_ref("hello"),
             BatchSize::SmallInput,
         )
     });
     c.bench_function("intern & drop fresh", |b| {
         b.iter_batched_ref(
-            Intern::<str>::new,
-            |i| intern_and_drop(i),
+            InternHash::<str>::new,
+            |i| {
+                i.intern_ref("hello");
+            },
             BatchSize::SmallInput,
         )
     });
     c.bench_function("intern & drop known", |b| {
         b.iter_batched_ref(
             || {
-                let i = Intern::<str>::new();
+                let i = InternHash::<str>::new();
                 i.intern_ref("hello");
                 i
             },
-            |i| intern_and_drop(i),
+            |i| {
+                i.intern_ref("hello");
+            },
             BatchSize::SmallInput,
+        )
+    });
+    c.bench_function("intern when crowded", |b| {
+        b.iter_batched_ref(
+            || {
+                let i = InternHash::<u32>::new();
+                for n in 0..100_000 {
+                    std::mem::forget(i.intern_sized(n));
+                }
+                i
+            },
+            |i| i.intern_sized(12345678),
+            BatchSize::SmallInput,
+        )
+    });
+    c.bench_function("intern large values", |b| {
+        b.iter_batched_ref(
+            || {
+                let i = InternHash::<[u8]>::new();
+                for _ in 0..100 {
+                    std::mem::forget(i.intern_box(large(500_000).into()))
+                }
+                i
+            },
+            |i| i.intern_box(large(500_000).into()),
+            BatchSize::LargeInput,
+        )
+    });
+    c.bench_function("intern large existing values", |b| {
+        b.iter_batched_ref(
+            || {
+                let i = InternHash::<[u8]>::new();
+                for _ in 0..100 {
+                    std::mem::forget(i.intern_box(large(500_000).into()))
+                }
+                let v = i.intern_box(large(500_000).into());
+                (i, v)
+            },
+            |(i, v)| i.intern_ref(v.as_ref()),
+            BatchSize::LargeInput,
+        )
+    });
+    c.bench_function("intern medium existing values", |b| {
+        b.iter_batched_ref(
+            || {
+                let i = InternHash::<[u8]>::new();
+                for _ in 0..1000 {
+                    std::mem::forget(i.intern_box(large(50_000).into()))
+                }
+                let v = i.intern_box(large(50_000).into());
+                (i, v)
+            },
+            |(i, v)| i.intern_ref(v.as_ref()),
+            BatchSize::LargeInput,
         )
     });
     c.finish();
@@ -52,40 +108,112 @@ fn hash(c: &mut Criterion) {
 
 fn ord(c: &mut Criterion) {
     let mut c = c.benchmark_group("ord");
+
     c.bench_function("intern fresh", |b| {
         b.iter_batched_ref(
-            || Intern::<str>::with_hash_limit(0),
-            |i| intern_hello(i),
+            InternOrd::<str>::new,
+            |i| i.intern_ref("hello"),
             BatchSize::SmallInput,
         )
     });
     c.bench_function("intern known", |b| {
         b.iter_batched_ref(
             || {
-                let i = Intern::<str>::with_hash_limit(0);
+                let i = InternOrd::<str>::new();
                 i.intern_ref("hello");
                 i
             },
-            |i| intern_hello(i),
+            |i| i.intern_ref("hello"),
             BatchSize::SmallInput,
         )
     });
     c.bench_function("intern & drop fresh", |b| {
         b.iter_batched_ref(
-            || Intern::<str>::with_hash_limit(0),
-            |i| intern_and_drop(i),
+            InternOrd::<str>::new,
+            |i| {
+                i.intern_ref("hello");
+            },
             BatchSize::SmallInput,
         )
     });
     c.bench_function("intern & drop known", |b| {
         b.iter_batched_ref(
             || {
-                let i = Intern::<str>::with_hash_limit(0);
+                let i = InternOrd::<str>::new();
                 i.intern_ref("hello");
                 i
             },
-            |i| intern_and_drop(i),
+            |i| {
+                i.intern_ref("hello");
+            },
             BatchSize::SmallInput,
+        )
+    });
+    c.bench_function("intern when crowded", |b| {
+        b.iter_batched_ref(
+            || {
+                let i = InternOrd::<u32>::new();
+                for n in 0..100_000 {
+                    std::mem::forget(i.intern_sized(n));
+                }
+                i
+            },
+            |i| i.intern_sized(12345678),
+            BatchSize::SmallInput,
+        )
+    });
+    c.bench_function("intern when moderately crowded", |b| {
+        b.iter_batched_ref(
+            || {
+                let i = InternOrd::<u32>::new();
+                for n in 0..100 {
+                    std::mem::forget(i.intern_sized(n));
+                }
+                i
+            },
+            |i| i.intern_sized(12345678),
+            BatchSize::SmallInput,
+        )
+    });
+    c.bench_function("intern large values", |b| {
+        b.iter_batched_ref(
+            || {
+                let i = InternOrd::<[u8]>::new();
+                for _ in 0..100 {
+                    std::mem::forget(i.intern_box(large(500_000).into()))
+                }
+                i
+            },
+            |i| i.intern_box(large(500_000).into()),
+            BatchSize::LargeInput,
+        )
+    });
+    c.bench_function("intern large existing values", |b| {
+        b.iter_batched_ref(
+            || {
+                let i = InternOrd::<[u8]>::new();
+                for _ in 0..100 {
+                    std::mem::forget(i.intern_box(large(500_000).into()))
+                }
+                let v = i.intern_box(large(500_000).into());
+                (i, v)
+            },
+            |(i, v)| i.intern_ref(v.as_ref()),
+            BatchSize::LargeInput,
+        )
+    });
+    c.bench_function("intern medium existing values", |b| {
+        b.iter_batched_ref(
+            || {
+                let i = InternOrd::<[u8]>::new();
+                for _ in 0..1000 {
+                    std::mem::forget(i.intern_box(large(50_000).into()))
+                }
+                let v = i.intern_box(large(50_000).into());
+                (i, v)
+            },
+            |(i, v)| i.intern_ref(v.as_ref()),
+            BatchSize::LargeInput,
         )
     });
     c.finish();

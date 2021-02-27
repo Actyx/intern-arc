@@ -1,7 +1,7 @@
 use std::{
     alloc::{alloc, dealloc, Layout},
     borrow::Borrow,
-    fmt::{Debug, Display, Formatter, Result},
+    fmt::{Debug, Display, Formatter, Pointer, Result},
     hash::{Hash, Hasher},
     intrinsics::drop_in_place,
     ops::Deref,
@@ -59,14 +59,18 @@ impl<T: ?Sized> RefCounted<T> {
             // write the fields
             (*ptr).refs = AtomicUsize::new(1);
             (*ptr).remove_if_last = AtomicPtr::new(std::ptr::null_mut());
-            std::ptr::copy_nonoverlapping(
-                // copy payload value byte-wise, because what else can we do?
-                b as *const u8,
-                &mut (*ptr).value as *mut _ as *mut u8,
-                std::mem::size_of_val(&*b),
-            );
-            // free the memory of the ex-Box
-            dealloc(b as *mut u8, Layout::for_value(&*b));
+            let num_bytes = std::mem::size_of_val(&*b);
+            if num_bytes > 0 {
+                std::ptr::copy_nonoverlapping(
+                    // copy payload value byte-wise, because what else can we do?
+                    b as *const u8,
+                    &mut (*ptr).value as *mut _ as *mut u8,
+                    num_bytes,
+                );
+                // free the memory of the ex-Box; global allocator does not allow zero-sized allocations
+                // so this must be guarded by num_bytes > 0
+                dealloc(b as *mut u8, Layout::for_value(&*b));
+            }
 
             NonNull::new_unchecked(ptr)
         }
@@ -92,8 +96,22 @@ pub struct Interned<T: ?Sized> {
 unsafe impl<T: ?Sized + Sync + Send> Send for Interned<T> {}
 unsafe impl<T: ?Sized + Sync + Send> Sync for Interned<T> {}
 
+/// An interned value
+///
+/// This type works very similar to an [`Arc`](https://doc.rust-lang.org/std/sync/struct.Arc.html)
+/// with the difference that it has no concept of weak references. They are not needed because
+/// **interned values must not be modified**, so reference cycles cannot be constructed. One
+/// reference is held by the interner that created this value as long as that interner lives.
+///
+/// Keeping interned values around does not keep the interner alive: once the last reference to
+/// the interner is dropped, it will release its existing interned values, so the backing memory
+/// will be released once each of the interned values is no longer referenced through any `Interned`
+/// instances. (`Interned` keeps a [`Weak`](https://doc.rust-lang.org/std/sync/struct.Weak.html)
+/// reference to the interner that created it, so it will prevent the `ArcInner` from being
+/// deallocated while it lives.)
 impl<T: ?Sized> Interned<T> {
-    /// Obtain current number of references, including this one, using Ordering::Relaxed.
+    /// Obtain current number of references, including this one, using
+    /// [`Ordering::Relaxed`](https://doc.rust-lang.org/std/sync/atomic/enum.Ordering.html#variant.Relaxed).
     /// This means that reads and writes of your code may be freely reordered around this
     /// read, there is no synchronisation with other threads.
     ///
@@ -139,12 +157,17 @@ impl<T: ?Sized> Clone for Interned<T> {
             // the below misspelling is deliberate
             panic!("either you are running on an 8086 or you are leaking Interned values at a phantastic rate");
         }
-        Self { inner: self.inner }
+        let ret = Self { inner: self.inner };
+        #[cfg(feature = "println")]
+        println!("clone {:p} {:p}", self, ret);
+        ret
     }
 }
 
 impl<T: ?Sized> Drop for Interned<T> {
     fn drop(&mut self) {
+        #[cfg(feature = "println")]
+        println!("dropping {:p}", self);
         // precondition:
         //  - this Interned may or may not be referenced by an interner (since the interner can be dropped)
         //  - the `self` reference guarantees that the reference count is at least one
@@ -165,17 +188,18 @@ impl<T: ?Sized> Drop for Interned<T> {
                 //    (race conditions against drop & clone, latter allows further usage and dropping)
                 // 3. this map reference plus external: successful remove_if_last or interner is being dropped
                 //    (race conditions against drop & clone)
-                let remove_ptr = self
-                    .inner()
-                    .remove_if_last
-                    .swap(std::ptr::null_mut(), Release);
-                if remove_ptr.is_null() {
+                const TAKEN: *mut u8 = std::mem::align_of::<RemovePtr<()>>() as *mut _;
+                // must not set to null here: spurious `get` failure in DashMap may lead to another make_hot
+                let remove_ptr = self.inner().remove_if_last.swap(TAKEN as *mut _, AcqRel);
+                if remove_ptr as *mut u8 == TAKEN {
                     // happens in scenario 2, in which case this has turned into a normal Arc.
                     // (here it might be that the function pointer is still held by the other concurrent dropper,
                     // but that one will put it back and retry)
                     // happens in scenario 1 during successful remove_if_last.
                     // happens in scenario 1 while dropping the interner.
                     // does not happen during interning race because there ref count is 1
+                    #[cfg(feature = "println")]
+                    println!("null {:p}", self);
                     break;
                 } else {
                     // we got a valid pointer because our weak reference is still in place
@@ -189,6 +213,8 @@ impl<T: ?Sized> Drop for Interned<T> {
                             // scenario 1 confirmed and races won:
                             // weak reference on interner has been dropped, so has our ref_count
                             // so the code below will now drop this value
+                            #[cfg(feature = "println")]
+                            println!("removed {:p}", self);
                             break;
                         }
                         RemovalResult::NotRemoved => {
@@ -200,11 +226,15 @@ impl<T: ?Sized> Drop for Interned<T> {
                             // have been dropped or interner dropped), so we must check again: seeing 3 means that
                             // someone else will successfully use the pointer in the future, seeing 1 means that
                             // the situation has been cleared up permanently, seeing 2 we need to try again
+                            #[cfg(feature = "println")]
+                            println!("loop {:p}", self);
                         }
                         RemovalResult::MapGone => {
                             // scenario 2 or scenario 1 with concurrent drop of interner
                             // the interner has begun dropping at some point in the past, so its reference to
                             // us is either gone or will be gone soon; in any case our weak reference to it is toast
+                            #[cfg(feature = "println")]
+                            println!("gone{:p}", self);
                             break;
                         }
                     }
@@ -219,8 +249,12 @@ impl<T: ?Sized> Drop for Interned<T> {
         // Acquire ordering is needed to synchronise with a possible Release on remove_if_last.
         let prior_refs = self.inner().refs.fetch_sub(1, Release);
         if prior_refs != 1 {
+            #[cfg(feature = "println")]
+            println!("no drop {:p}", self);
             return;
         }
+        #[cfg(feature = "println")]
+        println!("drop {:p}", self);
 
         // Final reference, do delete! We need to ensure that the previous drop on a different
         // thread has stopped using the data (i.e. synchronise with the Release above).
@@ -281,6 +315,12 @@ impl<T: ?Sized> Deref for Interned<T> {
     }
 }
 
+impl<T: ?Sized> AsRef<T> for Interned<T> {
+    fn as_ref(&self) -> &T {
+        self.deref()
+    }
+}
+
 impl<T: ?Sized + Debug> Debug for Interned<T> {
     fn fmt(&self, f: &mut Formatter<'_>) -> Result {
         write!(f, "Interned({:?})", &*self)
@@ -290,5 +330,11 @@ impl<T: ?Sized + Debug> Debug for Interned<T> {
 impl<T: ?Sized + Display> Display for Interned<T> {
     fn fmt(&self, f: &mut Formatter<'_>) -> Result {
         self.deref().fmt(f)
+    }
+}
+
+impl<T: ?Sized> Pointer for Interned<T> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> Result {
+        Pointer::fmt(&(&**self as *const T), f)
     }
 }
