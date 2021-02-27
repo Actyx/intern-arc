@@ -1,7 +1,7 @@
 use std::{
     alloc::{alloc, dealloc, Layout},
     borrow::Borrow,
-    fmt::{Debug, Formatter, Result},
+    fmt::{Debug, Display, Formatter, Result},
     hash::{Hash, Hasher},
     intrinsics::drop_in_place,
     ops::Deref,
@@ -88,6 +88,9 @@ impl<T: ?Sized> RefCounted<T> {
 pub struct Interned<T: ?Sized> {
     inner: NonNull<RefCounted<T>>,
 }
+
+unsafe impl<T: ?Sized + Sync + Send> Send for Interned<T> {}
+unsafe impl<T: ?Sized + Sync + Send> Sync for Interned<T> {}
 
 impl<T: ?Sized> Interned<T> {
     /// Obtain current number of references, including this one, using Ordering::Relaxed.
@@ -228,7 +231,7 @@ impl<T: ?Sized> Drop for Interned<T> {
             // this is how you drop unsized values ...
             drop_in_place(self.inner.as_ptr());
             // and then we still have to free the memory
-            dealloc(self.inner.as_ptr() as *mut u8, layout)
+            dealloc(self.inner.as_ptr() as *mut u8, layout);
         }
     }
 }
@@ -281,5 +284,11 @@ impl<T: ?Sized> Deref for Interned<T> {
 impl<T: ?Sized + Debug> Debug for Interned<T> {
     fn fmt(&self, f: &mut Formatter<'_>) -> Result {
         write!(f, "Interned({:?})", &*self)
+    }
+}
+
+impl<T: ?Sized + Display> Display for Interned<T> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> Result {
+        self.deref().fmt(f)
     }
 }

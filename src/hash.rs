@@ -7,9 +7,16 @@ use dashmap::DashMap;
 
 use crate::ref_count::{Interned, RemovalResult, RemovePtr};
 
-#[derive(Clone)]
 pub struct InternHash<T: ?Sized> {
     inner: Arc<Inner<T>>,
+}
+
+impl<T: ?Sized> Clone for InternHash<T> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+        }
+    }
 }
 
 #[repr(C)]
@@ -17,6 +24,9 @@ struct Inner<T: ?Sized> {
     remove_if_last: RemovePtr<T>,
     map: DashMap<Interned<T>, ()>,
 }
+
+unsafe impl<T: ?Sized + Sync + Send> Send for Inner<T> {}
+unsafe impl<T: ?Sized + Sync + Send> Sync for Inner<T> {}
 
 fn remove_if_last<T: ?Sized + Eq + Hash>(this: *const (), key: &Interned<T>) -> RemovalResult {
     // this is safe because we’re still holding a weak reference: the value may be dropped

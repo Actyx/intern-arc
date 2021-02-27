@@ -1,153 +1,127 @@
-use dashmap::DashMap;
+use crate::ref_count::{Interned, RemovalResult, RemovePtr};
+use parking_lot::{Mutex, MutexGuard};
 use std::{
-    any::TypeId,
-    collections::{btree_map::Entry, BTreeMap},
-    fmt::Display,
-    ops::Deref,
-    sync::{Arc, Mutex},
+    collections::BTreeSet,
+    sync::{Arc, Weak},
 };
 
-use crate::CONTAINER_TREE;
-
-struct TreeContainer<T: ?Sized> {
-    tree: Mutex<BTreeMap<Arc<T>, ()>>,
+pub struct InternOrd<T: ?Sized> {
+    inner: Arc<Inner<T>>,
 }
 
-impl<T: Ord + ?Sized> TreeContainer<T> {
-    pub fn new() -> Self {
-        TreeContainer {
-            tree: Mutex::new(BTreeMap::new()),
+impl<T: ?Sized> Clone for InternOrd<T> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
         }
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[repr(transparent)]
-pub struct InternedTree<T: ?Sized + Ord + 'static>(Arc<T>);
-
-impl<T: ?Sized + Ord + 'static> InternedTree<T> {
-    pub fn references(this: &Self) -> usize {
-        Arc::strong_count(&this.0)
-    }
+#[repr(C)]
+struct Inner<T: ?Sized> {
+    remove_if_last: RemovePtr<T>,
+    map: Mutex<BTreeSet<Interned<T>>>,
 }
 
-impl<T: ?Sized + Ord + 'static + Display> Display for InternedTree<T> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.0.fmt(f)
-    }
-}
+unsafe impl<T: ?Sized + Sync + Send> Send for Inner<T> {}
+unsafe impl<T: ?Sized + Sync + Send> Sync for Inner<T> {}
 
-impl<T: ?Sized + Ord + 'static> Deref for InternedTree<T> {
-    type Target = T;
-
-    fn deref(&self) -> &Self::Target {
-        self.0.deref()
-    }
-}
-
-impl<T: ?Sized + Ord + 'static> Drop for InternedTree<T> {
-    fn drop(&mut self) {
-        if Arc::strong_count(&self.0) == 2 {
-            if let Some(boxed) = CONTAINER_TREE
-                .get_or_init(DashMap::new)
-                .get(&TypeId::of::<T>())
-            {
-                let m = boxed.value().downcast_ref::<TreeContainer<T>>().unwrap();
-                let mut set = m.tree.lock().unwrap();
-                if Arc::strong_count(&self.0) == 2 {
-                    set.remove(&self.0);
-                }
+fn remove_if_last<T: ?Sized + Ord>(this: *const (), key: &Interned<T>) -> RemovalResult {
+    // this is safe because we’re still holding a weak reference: the value may be dropped
+    // but the ArcInner is still alive!
+    let weak = unsafe { Weak::from_raw(this as *const Inner<T>) };
+    match weak.upgrade() {
+        Some(strong) => {
+            let mut map = strong.map.lock();
+            if key.ref_count() == 2 {
+                map.remove(key);
+                // need to decrement this Arc’s weak count — can’t be done by Interned::Drop since it cannot know this type
+                drop(weak);
+                RemovalResult::Removed
+            } else {
+                // otherwise we need to keep the weak count because the caller will not drop the `this` pointer
+                // I prefer into_raw over forget because it clearly tells the Weak what is happening
+                Weak::into_raw(weak);
+                RemovalResult::NotRemoved
             }
         }
-    }
-}
-
-/// Intern a shared-ownership reference using tree map (will not clone)
-///
-/// Returns either the given Arc or an already-interned one pointing to an equivalent value.
-pub fn intern_tree_arc<T>(val: Arc<T>) -> InternedTree<T>
-where
-    T: Ord + Send + Sync + ?Sized + 'static,
-{
-    let type_map = CONTAINER_TREE.get_or_init(DashMap::new);
-
-    // Prefer taking the read lock to reduce contention, only use entry api if necessary.
-    let boxed = if let Some(boxed) = type_map.get(&TypeId::of::<T>()) {
-        boxed
-    } else {
-        type_map
-            .entry(TypeId::of::<T>())
-            .or_insert_with(|| Box::new(TreeContainer::<T>::new()))
-            .downgrade()
-    };
-
-    let m: &TreeContainer<T> = boxed.value().downcast_ref::<TreeContainer<T>>().unwrap();
-    let mut set = m.tree.lock().unwrap();
-    let ret = match set.entry(val) {
-        Entry::Vacant(x) => {
-            let ret = x.key().clone();
-            x.insert(());
-            ret
+        None => {
+            // This means that the last strong reference has started being dropped, so the map will be cleared.
+            // We drop the weak count because we won’t need to contact this interner anymore
+            drop(weak);
+            RemovalResult::MapGone
         }
-        Entry::Occupied(x) => x.key().clone(),
-    };
-
-    InternedTree(ret)
-}
-
-/// Intern an owned value using tree map (will not clone)
-pub fn intern_tree<T>(val: T) -> InternedTree<T>
-where
-    T: Ord + Send + Sync + 'static,
-{
-    intern_tree_arc(Arc::new(val))
-}
-
-/// Intern a non-owned reference using tree map (will clone)
-pub fn intern_tree_unsized<T>(val: &T) -> InternedTree<T>
-where
-    T: Ord + Send + Sync + ?Sized + 'static,
-    Arc<T>: for<'a> From<&'a T>,
-{
-    intern_tree_arc(Arc::from(val))
-}
-
-/// Intern an owned reference using tree map (will not clone)
-pub fn intern_tree_boxed<T>(val: Box<T>) -> InternedTree<T>
-where
-    T: Ord + Send + Sync + ?Sized + 'static,
-{
-    intern_tree_arc(Arc::from(val))
-}
-
-/// Perform internal maintenance (removing otherwise unreferenced elements) and return count of elements
-pub fn num_objects_interned_tree<T: Ord + ?Sized + 'static>() -> usize {
-    if let Some(m) = CONTAINER_TREE
-        .get()
-        .and_then(|type_map| type_map.get(&TypeId::of::<T>()))
-    {
-        let m = m.downcast_ref::<TreeContainer<T>>().unwrap();
-        let s = m.tree.lock().unwrap();
-        s.len()
-    } else {
-        0
     }
 }
 
-/// Feed an iterator over all interned values for the given type to the given function
-pub fn inspect_tree<T, F, U>(f: F) -> U
-where
-    T: Ord + ?Sized + 'static,
-    F: for<'a> FnOnce(Box<dyn Iterator<Item = Arc<T>> + 'a>) -> U,
-{
-    let o = CONTAINER_TREE
-        .get()
-        .and_then(|type_map| type_map.get(&TypeId::of::<T>()));
-    if let Some(r) = o {
-        let m = r.downcast_ref::<TreeContainer<T>>().unwrap();
-        let map = m.tree.lock().unwrap();
-        f(Box::new(map.iter().map(|(k, _v)| k.clone())))
-    } else {
-        f(Box::new(std::iter::empty()))
+impl<T: ?Sized + Ord> InternOrd<T> {
+    pub fn new() -> Self {
+        Self {
+            inner: Arc::new(Inner {
+                remove_if_last,
+                map: Mutex::new(BTreeSet::new()),
+            }),
+        }
+    }
+
+    fn map(&self) -> MutexGuard<BTreeSet<Interned<T>>> {
+        self.inner.map.lock()
+    }
+
+    pub fn len(&self) -> usize {
+        self.map().len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.map().is_empty()
+    }
+
+    fn intern(
+        &self,
+        mut map: MutexGuard<BTreeSet<Interned<T>>>,
+        interned: Interned<T>,
+    ) -> Interned<T> {
+        let mut ret = interned.clone();
+        map.insert(interned);
+        let me = Weak::into_raw(Arc::downgrade(&self.inner));
+        ret.make_hot(me as *mut RemovePtr<T>);
+        ret
+    }
+
+    pub fn intern_ref(&self, value: &T) -> Interned<T>
+    where
+        T: ToOwned,
+        T::Owned: Into<Box<T>>,
+    {
+        let map = self.map();
+        if let Some(entry) = map.get(value) {
+            return entry.clone();
+        }
+        self.intern(map, Interned::from_box(value.to_owned().into()))
+    }
+
+    pub fn intern_box(&self, value: Box<T>) -> Interned<T> {
+        let map = self.map();
+        if let Some(entry) = map.get(value.as_ref()) {
+            return entry.clone();
+        }
+        self.intern(map, Interned::from_box(value))
+    }
+
+    pub fn intern_sized(&self, value: T) -> Interned<T>
+    where
+        T: Sized,
+    {
+        let map = self.map();
+        if let Some(entry) = map.get(&value) {
+            return entry.clone();
+        }
+        self.intern(map, Interned::from_sized(value))
+    }
+}
+
+impl<T: ?Sized + Ord> Default for InternOrd<T> {
+    fn default() -> Self {
+        Self::new()
     }
 }

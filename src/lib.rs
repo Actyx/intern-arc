@@ -13,74 +13,92 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-//! Library for interning based on stdlib Arc
-//!
-//! The design of the hash-based half is taken from the [`arc-interner`](https://docs.rs/arc-interner)
-//! crate, with the addition of another half based on [`BTreeMap`](https://doc.rust-lang.org/std/collections/struct.BTreeMap.html).
-//! Local benchmarks have shown that hashing is faster for objects below 1kB while tree traversal
-//! and comparisons are faster above 1kB (very roughly and broadly speaking).
-//!
-//! The main functions exist in three variants:
-//!
-//!  - `intern_hash` and friends for when you want to use hashing (or have no `Ord` instance at hand)
-//!  - `intern_tree` and friends for when you want to use tree map (or have no `Hash` instance at hand)
-//!  - `intern` and friends to automatically choose based on object size
-//!
-//! Within each of these classes, four function exist to ingest data in various forms:
-//!
-//! ```
-//! use std::sync::Arc;
-//! use intern_arc::{intern, intern_unsized, intern_boxed, intern_arc, Interned};
-//!
-//! // for sized types
-//! let a1: Interned<String> = intern("hello".to_owned());
-//!
-//! // for unsized non-owned types
-//! let a2: Interned<str> = intern_unsized("hello");
-//!
-//! // for unsized owned types
-//! let a3: Interned<str> = intern_boxed(Box::<str>::from("hello"));
-//!
-//! // for types with shared ownership
-//! let a4: Interned<str> = intern_arc(Arc::<str>::from("hello"));
-//! ```
-//!
-//! # Introspection
-//!
-//! This library offers some utilities for checking how well it works for a given use-case:
-//!
-//! ```
-//! use std::sync::Arc;
-//! use intern_arc::{inspect_hash, num_objects_interned_hash, types_interned};
-//!
-//! println!("str: {} objects", num_objects_interned_hash::<str>());
-//!
-//! let (hash, tree) = types_interned();
-//! println!("types interned: {} with hashing, {} with trees", hash, tree);
-//!
-//! inspect_hash::<[u8], _, _>(|iter| {
-//!     for arc in iter {
-//!         println!("{} x {:?}", Arc::strong_count(&arc), arc);
-//!     }
-//! });
-//! ```
-//!
-//! All functions exist also with `tree` suffix instead of `hash`.
+//! Interning library based on atomic reference counting
 #![doc(html_logo_url = "https://developer.actyx.com/img/logo.svg")]
 #![doc(html_favicon_url = "https://developer.actyx.com/img/favicon.ico")]
 
 mod hash;
 mod ref_count;
-// mod tree;
+mod tree;
 
 pub use hash::InternHash;
 pub use ref_count::Interned;
-// pub use tree::InternedTree;
+pub use tree::InternOrd;
+
+use std::hash::Hash;
+
+pub struct Intern<T: ?Sized> {
+    hash_limit: usize,
+    hash: InternHash<T>,
+    ord: InternOrd<T>,
+}
+
+impl<T: ?Sized + Eq + Hash + Ord> Intern<T> {
+    pub fn new() -> Self {
+        Intern::default()
+    }
+
+    pub fn with_hash_limit(limit: usize) -> Self {
+        Self {
+            hash_limit: limit,
+            ..Default::default()
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.hash.len() + self.ord.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.hash.is_empty() && self.ord.is_empty()
+    }
+
+    pub fn intern_ref(&self, value: &T) -> Interned<T>
+    where
+        T: ToOwned,
+        T::Owned: Into<Box<T>>,
+    {
+        if std::mem::size_of_val(value) > self.hash_limit {
+            self.ord.intern_ref(value)
+        } else {
+            self.hash.intern_ref(value)
+        }
+    }
+
+    pub fn intern_box(&self, value: Box<T>) -> Interned<T> {
+        if std::mem::size_of_val(value.as_ref()) > self.hash_limit {
+            self.ord.intern_box(value)
+        } else {
+            self.hash.intern_box(value)
+        }
+    }
+
+    pub fn intern_sized(&self, value: T) -> Interned<T>
+    where
+        T: Sized,
+    {
+        if std::mem::size_of_val(&value) > self.hash_limit {
+            self.ord.intern_sized(value)
+        } else {
+            self.hash.intern_sized(value)
+        }
+    }
+}
+
+impl<T: ?Sized + Eq + Hash + Ord> Default for Intern<T> {
+    fn default() -> Self {
+        Self {
+            hash_limit: 1000,
+            hash: Default::default(),
+            ord: Default::default(),
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {
     use crate::*;
-    //     use std::thread;
+    use std::thread;
 
     // Test basic functionality.
     #[test]
@@ -151,104 +169,167 @@ mod tests {
         assert_eq!(interned1.ref_count(), 1);
     }
 
-    //     // Test basic functionality.
-    //     #[test]
-    //     fn basic_tree() {
-    //         assert_eq!(intern_tree("foo"), intern_tree("foo"));
-    //         assert_ne!(intern_tree("foo"), intern_tree("bar"));
-    //         // The above refs should be deallocated by now.
-    //         assert_eq!(num_objects_interned_tree::<&str>(), 0);
+    // Test basic functionality.
+    #[test]
+    fn basic_ord() {
+        let interner = InternOrd::<&str>::new();
 
-    //         let _interned1 = intern_tree("foo".to_string());
-    //         {
-    //             let interned2 = intern_tree("foo".to_string());
-    //             let interned3 = intern_tree("bar".to_string());
+        assert_eq!(interner.intern_sized("foo"), interner.intern_sized("foo"));
+        assert_ne!(interner.intern_sized("foo"), interner.intern_sized("bar"));
+        // The above refs should be deallocated by now.
+        assert_eq!(interner.len(), 0);
 
-    //             assert_eq!(InternedTree::references(&interned2), 3);
-    //             assert_eq!(InternedTree::references(&interned3), 2);
-    //             // We now have two unique interned strings: "foo" and "bar".
-    //             assert_eq!(num_objects_interned_tree::<String>(), 2);
-    //         }
+        let interner = InternOrd::<String>::new();
 
-    //         // "bar" is now gone.
-    //         assert_eq!(num_objects_interned_tree::<String>(), 1);
-    //     }
+        let interned1 = interner.intern_sized("foo".to_string());
+        {
+            let interned2 = interner.intern_sized("foo".to_string());
+            let interned3 = interner.intern_sized("bar".to_string());
 
-    //     // Test basic functionality.
-    //     #[test]
-    //     fn basic_tree_unsized() {
-    //         assert_eq!(intern_tree_unsized("foo"), intern_tree_unsized("foo"));
-    //         assert_ne!(intern_tree_unsized("foo"), intern_tree_unsized("bar"));
-    //         // The above refs should be deallocated by now.
-    //         assert_eq!(num_objects_interned_tree::<str>(), 0);
+            assert_eq!(interned2.ref_count(), 3);
+            assert_eq!(interned3.ref_count(), 2);
+            // We now have two unique interned strings: "foo" and "bar".
+            assert_eq!(interner.len(), 2);
+        }
 
-    //         let _interned1 = intern_tree_unsized("foo");
-    //         {
-    //             let interned2 = intern_tree_unsized("foo");
-    //             let interned3 = intern_tree_unsized("bar");
+        // "bar" is now gone.
+        assert_eq!(interner.len(), 1);
 
-    //             assert_eq!(InternedTree::references(&interned2), 3);
-    //             assert_eq!(InternedTree::references(&interned3), 2);
-    //             // We now have two unique interned strings: "foo" and "bar".
-    //             assert_eq!(num_objects_interned_tree::<str>(), 2);
-    //         }
+        drop(interner);
+        assert_eq!(interned1.ref_count(), 1);
+    }
 
-    //         // "bar" is now gone.
-    //         assert_eq!(num_objects_interned_tree::<str>(), 1);
-    //     }
+    // Test basic functionality.
+    #[test]
+    fn basic_ord_unsized() {
+        let interner = InternOrd::<str>::new();
 
-    //     // Ordering should be based on values, not pointers.
-    //     // Also tests `Display` implementation.
-    //     #[test]
-    //     fn sorting() {
-    //         let mut interned_vals = vec![
-    //             intern_hash(4),
-    //             intern_hash(2),
-    //             intern_hash(5),
-    //             intern_hash(0),
-    //             intern_hash(1),
-    //             intern_hash(3),
-    //         ];
-    //         interned_vals.sort();
-    //         let sorted: Vec<String> = interned_vals.iter().map(|v| format!("{}", v)).collect();
-    //         assert_eq!(&sorted.join(","), "0,1,2,3,4,5");
-    //     }
+        assert_eq!(interner.intern_ref("foo"), interner.intern_ref("foo"));
+        assert_ne!(interner.intern_ref("foo"), interner.intern_ref("bar"));
+        // The above refs should be deallocated by now.
+        assert_eq!(interner.len(), 0);
 
-    //     #[derive(Eq, PartialEq, Ord, PartialOrd, Hash)]
-    //     pub struct TestStruct2(String, u64);
+        let interned1 = interner.intern_ref("foo");
+        {
+            let interned2 = interner.intern_ref("foo");
+            let interned3 = interner.intern_ref("bar");
 
-    //     #[test]
-    //     fn sequential() {
-    //         for _i in 0..10_000 {
-    //             let mut interned = Vec::with_capacity(100);
-    //             for j in 0..100 {
-    //                 interned.push(intern_hash(TestStruct2("foo".to_string(), j)));
-    //             }
-    //         }
+            assert_eq!(interned2.ref_count(), 3);
+            assert_eq!(interned3.ref_count(), 2);
+            // We now have two unique interned strings: "foo" and "bar".
+            assert_eq!(interner.len(), 2);
+        }
 
-    //         assert_eq!(num_objects_interned_hash::<TestStruct2>(), 0);
-    //     }
+        // "bar" is now gone.
+        assert_eq!(interner.len(), 1);
 
-    //     #[derive(Eq, PartialEq, Ord, PartialOrd, Hash)]
-    //     pub struct TestStruct(String, u64);
+        assert_eq!(
+            &*interned1 as *const _,
+            &*interner.intern_ref("foo") as *const _
+        );
 
-    //     // Quickly create and destroy a small number of interned objects from
-    //     // multiple threads.
-    //     #[test]
-    //     fn multithreading1() {
-    //         let mut thandles = vec![];
-    //         for _i in 0..10 {
-    //             thandles.push(thread::spawn(|| {
-    //                 for _i in 0..100_000 {
-    //                     let _interned1 = intern_hash(TestStruct("foo".to_string(), 5));
-    //                     let _interned2 = intern_hash(TestStruct("bar".to_string(), 10));
-    //                 }
-    //             }));
-    //         }
-    //         for h in thandles.into_iter() {
-    //             h.join().unwrap()
-    //         }
+        drop(interner);
 
-    //         assert_eq!(num_objects_interned_hash::<TestStruct>(), 0);
-    //     }
+        assert_ne!(
+            &*interned1 as *const _,
+            &*InternOrd::new().intern_ref("foo") as *const _
+        );
+
+        assert_eq!(interned1.ref_count(), 1);
+    }
+
+    // Ordering should be based on values, not pointers.
+    // Also tests `Display` implementation.
+    #[test]
+    fn sorting() {
+        let interner = InternHash::new();
+        let mut interned_vals = vec![
+            interner.intern_sized(4),
+            interner.intern_sized(2),
+            interner.intern_sized(5),
+            interner.intern_sized(0),
+            interner.intern_sized(1),
+            interner.intern_sized(3),
+        ];
+        interned_vals.sort();
+        let sorted: Vec<String> = interned_vals.iter().map(|v| format!("{}", v)).collect();
+        assert_eq!(&sorted.join(","), "0,1,2,3,4,5");
+    }
+
+    #[derive(Eq, PartialEq, Ord, PartialOrd, Hash)]
+    pub struct TestStruct(String, u64);
+
+    #[test]
+    fn sequential_hash() {
+        let interner = InternHash::new();
+
+        for _i in 0..1_000 {
+            let mut interned = Vec::with_capacity(100);
+            for j in 0..100 {
+                interned.push(interner.intern_sized(TestStruct("foo".to_string(), j)));
+            }
+        }
+
+        assert_eq!(interner.len(), 0);
+    }
+
+    #[test]
+    fn sequential_ord() {
+        let interner = InternOrd::new();
+
+        for _i in 0..1_000 {
+            let mut interned = Vec::with_capacity(100);
+            for j in 0..100 {
+                interned.push(interner.intern_sized(TestStruct("foo".to_string(), j)));
+            }
+        }
+
+        assert_eq!(interner.len(), 0);
+    }
+
+    // Quickly create and destroy a small number of interned objects from
+    // multiple threads.
+    #[test]
+    fn multithreading_hash() {
+        let interner = InternHash::new();
+
+        let mut thandles = vec![];
+        for _i in 0..10 {
+            let interner = interner.clone();
+            thandles.push(thread::spawn(move || {
+                for _i in 0..1_000 {
+                    let _interned1 = interner.intern_sized(TestStruct("foo".to_string(), 5));
+                    let _interned2 = interner.intern_sized(TestStruct("bar".to_string(), 10));
+                }
+            }));
+        }
+        for h in thandles.into_iter() {
+            h.join().unwrap()
+        }
+
+        assert_eq!(interner.len(), 0);
+    }
+
+    // Quickly create and destroy a small number of interned objects from
+    // multiple threads.
+    #[test]
+    fn multithreading_ord() {
+        let interner = InternOrd::new();
+
+        let mut thandles = vec![];
+        for _i in 0..10 {
+            let interner = interner.clone();
+            thandles.push(thread::spawn(move || {
+                for _i in 0..1_000 {
+                    let _interned1 = interner.intern_sized(TestStruct("foo".to_string(), 5));
+                    let _interned2 = interner.intern_sized(TestStruct("bar".to_string(), 10));
+                }
+            }));
+        }
+        for h in thandles.into_iter() {
+            h.join().unwrap()
+        }
+
+        assert_eq!(interner.len(), 0);
+    }
 }
