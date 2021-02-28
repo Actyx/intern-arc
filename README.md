@@ -8,3 +8,7 @@ Once you notice problems, debugging is easier with
 ```bash
 cargo +nightly miri test --features println -- --nocapture multithreading_hash
 ```
+
+## License
+
+At your option: Apache-2.0 or MIT

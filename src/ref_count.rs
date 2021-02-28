@@ -1,3 +1,18 @@
+/*
+ * Copyright 2021 Actyx AG
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
 use std::{
     alloc::{alloc, dealloc, Layout},
     borrow::Borrow,
@@ -159,15 +174,17 @@ impl<T: ?Sized> Clone for Interned<T> {
         }
         let ret = Self { inner: self.inner };
         #[cfg(feature = "println")]
-        println!("clone {:p} {:p}", self, ret);
+        println!("clone {:p} {:p}", *self, ret);
         ret
     }
 }
 
 impl<T: ?Sized> Drop for Interned<T> {
     fn drop(&mut self) {
+        // printing `self` to mark this particular execution (points to the stack)
+        // printing `*self` to mark the interned value (as printed by `clone`)
         #[cfg(feature = "println")]
-        println!("dropping {:p}", self);
+        println!("dropping {:p} {:p}", self, *self);
         // precondition:
         //  - this Interned may or may not be referenced by an interner (since the interner can be dropped)
         //  - the `self` reference guarantees that the reference count is at least one
@@ -199,7 +216,7 @@ impl<T: ?Sized> Drop for Interned<T> {
                     // happens in scenario 1 while dropping the interner.
                     // does not happen during interning race because there ref count is 1
                     #[cfg(feature = "println")]
-                    println!("null {:p}", self);
+                    println!("null {:p} {:p}", self, *self);
                     break;
                 } else {
                     // we got a valid pointer because our weak reference is still in place
@@ -214,7 +231,7 @@ impl<T: ?Sized> Drop for Interned<T> {
                             // weak reference on interner has been dropped, so has our ref_count
                             // so the code below will now drop this value
                             #[cfg(feature = "println")]
-                            println!("removed {:p}", self);
+                            println!("removed {:p} {:p}", self, *self);
                             break;
                         }
                         RemovalResult::NotRemoved => {
@@ -227,14 +244,14 @@ impl<T: ?Sized> Drop for Interned<T> {
                             // someone else will successfully use the pointer in the future, seeing 1 means that
                             // the situation has been cleared up permanently, seeing 2 we need to try again
                             #[cfg(feature = "println")]
-                            println!("loop {:p}", self);
+                            println!("loop {:p} {:p}", self, *self);
                         }
                         RemovalResult::MapGone => {
                             // scenario 2 or scenario 1 with concurrent drop of interner
                             // the interner has begun dropping at some point in the past, so its reference to
                             // us is either gone or will be gone soon; in any case our weak reference to it is toast
                             #[cfg(feature = "println")]
-                            println!("gone{:p}", self);
+                            println!("gone{:p} {:p}", self, *self);
                             break;
                         }
                     }
@@ -250,11 +267,11 @@ impl<T: ?Sized> Drop for Interned<T> {
         let prior_refs = self.inner().refs.fetch_sub(1, Release);
         if prior_refs != 1 {
             #[cfg(feature = "println")]
-            println!("no drop {:p}", self);
+            println!("no_drop {:p} {:p}", self, *self);
             return;
         }
         #[cfg(feature = "println")]
-        println!("drop {:p}", self);
+        println!("drop {:p} {:p}", self, *self);
 
         // Final reference, do delete! We need to ensure that the previous drop on a different
         // thread has stopped using the data (i.e. synchronise with the Release above).
@@ -336,5 +353,18 @@ impl<T: ?Sized + Display> Display for Interned<T> {
 impl<T: ?Sized> Pointer for Interned<T> {
     fn fmt(&self, f: &mut Formatter<'_>) -> Result {
         Pointer::fmt(&(&**self as *const T), f)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::InternOrd;
+
+    #[test]
+    fn pointer() {
+        let interner = InternOrd::new();
+        let i = interner.intern_sized(42);
+        let i2 = i.clone();
+        assert_eq!(format!("{:p}", i), format!("{:p}", i2));
     }
 }
