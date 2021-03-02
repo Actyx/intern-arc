@@ -6,6 +6,7 @@ When developing please make use of `cargo bench` and `cargo +nightly miri` —
 Once you notice problems, debugging is easier with
 
 ```bash
+export MIRIFLAGS=-Zmiri-disable-isolation
 cargo +nightly miri test --features println -- --nocapture multithreading_hash
 ```
 

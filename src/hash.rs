@@ -20,7 +20,7 @@ use std::{
 
 use dashmap::DashMap;
 
-use crate::ref_count::{Interned, RemovalResult, RemovePtr};
+use crate::ref_count::{Interned, RemovePtr};
 
 pub struct InternHash<T: ?Sized> {
     inner: Arc<Inner<T>>,
@@ -36,43 +36,21 @@ impl<T: ?Sized> Clone for InternHash<T> {
 
 #[repr(C)]
 struct Inner<T: ?Sized> {
-    remove_if_last: RemovePtr<T>,
+    remover: RemovePtr<T>,
     map: DashMap<Interned<T>, ()>,
 }
 
 unsafe impl<T: ?Sized + Sync + Send> Send for Inner<T> {}
 unsafe impl<T: ?Sized + Sync + Send> Sync for Inner<T> {}
 
-fn remove_if_last<T: ?Sized + Eq + Hash>(this: *const (), key: &Interned<T>) -> RemovalResult {
+fn remover<T: ?Sized + Eq + Hash>(this: *const (), key: &Interned<T>) {
     // this is safe because we’re still holding a weak reference: the value may be dropped
     // but the ArcInner is still alive!
     let weak = unsafe { Weak::from_raw(this as *const Inner<T>) };
-    let success = match weak.upgrade() {
-        Some(strong) => strong
-            .map
-            .remove_if(key, |k, _| {
-                let r = k.ref_count();
-                #[cfg(feature = "println")]
-                println!("refs {} {:p}", r, key);
-                r == 2
-            })
-            .is_some(),
-        None => {
-            // This means that the last strong reference has started being dropped, so the map will be cleared.
-            // We drop the weak count because we won’t need to contact this interner anymore
-            drop(weak);
-            return RemovalResult::MapGone;
-        }
-    };
-    if success {
-        // need to decrement this Arc’s weak count — can’t be done by Interned::Drop since it cannot know this type
-        drop(weak);
-        RemovalResult::Removed
-    } else {
-        // otherwise we need to keep the weak count because the caller will not drop the `this` pointer
-        // I prefer into_raw over forget because it clearly tells the Weak what is happening
-        Weak::into_raw(weak);
-        RemovalResult::NotRemoved
+    if let Some(strong) = weak.upgrade() {
+        // need to bind the return value so that the map’s lock is released
+        // before the value is dropped
+        let _value = strong.map.remove(key);
     }
 }
 
@@ -88,7 +66,7 @@ impl<T: ?Sized + Eq + Hash> InternHash<T> {
     pub fn new() -> Self {
         Self {
             inner: Arc::new(Inner {
-                remove_if_last,
+                remover,
                 map: DashMap::new(),
             }),
         }
@@ -105,6 +83,7 @@ impl<T: ?Sized + Eq + Hash> InternHash<T> {
     }
 
     fn intern(&self, interned: Interned<T>) -> Interned<T> {
+        // this method may be called even thought the entry is already in the map, cf. https://github.com/xacrimon/dashmap/issues/139
         let entry = self.inner.map.entry(interned).or_insert(());
         let mut ret = entry.key().clone();
         drop(entry);

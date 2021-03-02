@@ -18,25 +18,21 @@ use std::{
     borrow::Borrow,
     fmt::{Debug, Display, Formatter, Pointer, Result},
     hash::{Hash, Hasher},
+    hint::spin_loop,
     intrinsics::drop_in_place,
     ops::Deref,
     ptr::NonNull,
     sync::atomic::{AtomicPtr, AtomicUsize, Ordering::*},
+    thread::yield_now,
 };
 
-pub(crate) type RemovePtr<T> = fn(*const (), &Interned<T>) -> RemovalResult;
-pub(crate) enum RemovalResult {
-    /// weak reference has been dropped
-    Removed,
-    /// weak reference has NOT been dropped
-    NotRemoved,
-    /// weak reference has been dropped
-    MapGone,
-}
+pub(crate) type RemovePtr<T> = fn(*const (), &Interned<T>);
 
 #[repr(C)]
 struct RefCounted<T: ?Sized> {
     /// number of references held to this value, including the one from the interner map
+    ///
+    /// highest bit stores whether the remove_if_lsat pointer has been consumed
     refs: AtomicUsize,
     /// Pointer to the location of a function pointer that can remove a given
     /// Interned<T> from the interner map. This same pointer is also provided
@@ -44,9 +40,9 @@ struct RefCounted<T: ?Sized> {
     /// the interner state in memory, so use #[repr(C)] and put the function
     /// pointer first!
     ///
-    /// The function must remove the value from the interner if the reference
-    /// count is TWO (one for the map, one for the last external reference).
-    remove_if_last: AtomicPtr<RemovePtr<T>>,
+    /// The function must remove the value from the interner and drop the
+    /// weak reference to the pointed-to location.
+    remover: AtomicPtr<RemovePtr<T>>,
     value: T,
 }
 
@@ -73,7 +69,7 @@ impl<T: ?Sized> RefCounted<T> {
             };
             // write the fields
             (*ptr).refs = AtomicUsize::new(1);
-            (*ptr).remove_if_last = AtomicPtr::new(std::ptr::null_mut());
+            (*ptr).remover = AtomicPtr::new(std::ptr::null_mut());
             let num_bytes = std::mem::size_of_val(&*b);
             if num_bytes > 0 {
                 std::ptr::copy_nonoverlapping(
@@ -97,7 +93,7 @@ impl<T: ?Sized> RefCounted<T> {
     {
         let b = Box::new(Self {
             refs: AtomicUsize::new(1),
-            remove_if_last: AtomicPtr::new(std::ptr::null_mut()),
+            remover: AtomicPtr::new(std::ptr::null_mut()),
             value,
         });
         NonNull::from(Box::leak(b))
@@ -159,22 +155,28 @@ impl<T: ?Sized> Interned<T> {
 
     pub(crate) fn make_hot(&mut self, map: *mut RemovePtr<T>) -> bool {
         self.inner()
-            .remove_if_last
+            .remover
             .compare_exchange(std::ptr::null_mut(), map, Relaxed, Relaxed)
             .is_ok()
     }
 }
 
+// use the two upper bits as spin-wait conditions
+const MAX_REFCOUNT: usize = usize::MAX - 2;
+
+// cannot use null: spurious `get` failure in DashMap may lead to another make_hot
+// which we prevent by using a non-null marker when taking the removal function
+const TAKEN: *mut u8 = std::mem::align_of::<RemovePtr<()>>() as *mut _;
+
 impl<T: ?Sized> Clone for Interned<T> {
     fn clone(&self) -> Self {
-        const MAX_REFCOUNT: usize = usize::MAX - 1;
-        if self.inner().refs.fetch_add(1, Relaxed) == MAX_REFCOUNT {
+        if self.inner().refs.fetch_add(1, Relaxed) >= MAX_REFCOUNT {
             // the below misspelling is deliberate
             panic!("either you are running on an 8086 or you are leaking Interned values at a phantastic rate");
         }
         let ret = Self { inner: self.inner };
         #[cfg(feature = "println")]
-        println!("clone {:p} {:p}", *self, ret);
+        println!("clone {:p}", *self);
         ret
     }
 }
@@ -185,104 +187,85 @@ impl<T: ?Sized> Drop for Interned<T> {
         // printing `*self` to mark the interned value (as printed by `clone`)
         #[cfg(feature = "println")]
         println!("dropping {:p} {:p}", self, *self);
-        // precondition:
+
+        // preconditions:
         //  - this Interned may or may not be referenced by an interner (since the interner can be dropped)
         //  - the `self` reference guarantees that the reference count is at least one
         //  - whatever happens, we must decrement the reference count by one
         //  - if the only remaining reference is the interner map, we need to try to remove it
-        //    (this races against an `intern` call for the same value)
+        //    (this races against an `intern` call for the same value and against dropping the interner)
         //
         // IMPORTANT NOTE: each Interned starts out with two references!
+        //
+        // Also, THE REMOVAL POINTER NEEDS TO BE USED EXACTLY ONCE!
 
-        // after decrementing the reference count, we must consider our memory to be freed
-        // by another thread (impossible when prior_refs == 1), so all work must happen before
-        loop {
-            if self.inner().refs.load(Relaxed) == 2 {
-                // three scenarios:
-                // 1. this external reference plus the map
-                //    (only race condition is against interning of same value or drop of interner)
-                // 2. this external reference plus another external
-                //    (race conditions against drop & clone, latter allows further usage and dropping)
-                // 3. this map reference plus external: successful remove_if_last or interner is being dropped
-                //    (race conditions against drop & clone)
-                const TAKEN: *mut u8 = std::mem::align_of::<RemovePtr<()>>() as *mut _;
-                // must not set to null here: spurious `get` failure in DashMap may lead to another make_hot
-                let remove_ptr = self.inner().remove_if_last.swap(TAKEN as *mut _, AcqRel);
-                if remove_ptr as *mut u8 == TAKEN {
-                    // happens in scenario 2, in which case this has turned into a normal Arc.
-                    // (here it might be that the function pointer is still held by the other concurrent dropper,
-                    // but that one will put it back and retry)
-                    // happens in scenario 1 during successful remove_if_last.
-                    // happens in scenario 1 while dropping the interner.
-                    // does not happen during interning race because there ref count is 1
-                    #[cfg(feature = "println")]
-                    println!("null {:p} {:p}", self, *self);
-                    break;
-                } else {
-                    // we got a valid pointer because our weak reference is still in place
-                    //
-                    // THIS FUNCTION POINTER MUST BE USED SUCCESSFULLY EXACTLY ONCE!
-                    //
-                    let raw_arc = remove_ptr as *const ();
-                    let remove_if_last = unsafe { *remove_ptr };
-                    match remove_if_last(raw_arc, self) {
-                        RemovalResult::Removed => {
-                            // scenario 1 confirmed and races won:
-                            // weak reference on interner has been dropped, so has our ref_count
-                            // so the code below will now drop this value
-                            #[cfg(feature = "println")]
-                            println!("removed {:p} {:p}", self, *self);
-                            break;
-                        }
-                        RemovalResult::NotRemoved => {
-                            // scenario 1 confirmed and race lost:
-                            // another thread has won the race and obtained a fresh reference, so we
-                            // keep our weak reference and put back the removal function pointer
-                            self.inner().remove_if_last.store(remove_ptr, Release);
-                            // at this point it is unclear what else has happened (other reference could already
-                            // have been dropped or interner dropped), so we must check again: seeing 3 means that
-                            // someone else will successfully use the pointer in the future, seeing 1 means that
-                            // the situation has been cleared up permanently, seeing 2 we need to try again
-                            #[cfg(feature = "println")]
-                            println!("loop {:p} {:p}", self, *self);
-                        }
-                        RemovalResult::MapGone => {
-                            // scenario 2 or scenario 1 with concurrent drop of interner
-                            // the interner has begun dropping at some point in the past, so its reference to
-                            // us is either gone or will be gone soon; in any case our weak reference to it is toast
-                            #[cfg(feature = "println")]
-                            println!("gone{:p} {:p}", self, *self);
-                            break;
-                        }
-                    }
-                }
-            } else {
-                break;
-            }
-        }
+        // decrement the count and read the value; the Release synchronises with an Acquire in case we deallocate
+        let read = self.inner().refs.fetch_sub(1, Release);
+        // two cases require action:
+        //  - count was two: perform the removal (unless already done)
+        //  - count was one: deallocate
 
-        // Release ordering is needed to be able to synchronise with the Acquire before actually dropping the value
-        // to ensure that there cannot be any pending writes to the allocation.
-        // Acquire ordering is needed to synchronise with a possible Release on remove_if_last.
-        let prior_refs = self.inner().refs.fetch_sub(1, Release);
-        if prior_refs != 1 {
-            #[cfg(feature = "println")]
-            println!("no_drop {:p} {:p}", self, *self);
-            return;
-        }
         #[cfg(feature = "println")]
-        println!("drop {:p} {:p}", self, *self);
+        println!("read {} {:p} {:p}", read, self, *self);
 
-        // Final reference, do delete! We need to ensure that the previous drop on a different
-        // thread has stopped using the data (i.e. synchronise with the Release above).
-        assert!(self.inner().refs.load(Acquire) == 0);
+        if read == 2 {
+            // the other reference could be the map or external (if the map was dropped and we didn’t get here yet)
+            // so this races against:
+            //  1. map being dropped
+            //  2. same value being interned again
+            //  3. other external reference being dropped
+            // In the dropping cases, the other thread saw read == 1.
+            let remove_ptr = self.inner().remover.swap(TAKEN as *mut _, AcqRel);
+            if remove_ptr as *mut u8 != TAKEN {
+                #[cfg(feature = "println")]
+                println!("remover {:p} {:p}", self, *self);
+                // We’re the first to see ref_count 2, so drop the connection to the interner.
+                // There is a race here against concurrent interning of the same value or clone & drop
+                // of this value if the interner was dropped earlier. In both cases we leave the
+                // interner without this value, which in the first case means that a freshly interned
+                // and live value is now unknown to the interner — interning it again will yield a
+                // different RefCounted instance (which is why we can’t support pointer Eq).
+                let raw_arc = remove_ptr as *const ();
+                let remover = unsafe { *remove_ptr };
+                remover(raw_arc, self);
+            } else {
+                #[cfg(feature = "println")]
+                println!("second {:p} {:p}", self, *self);
+            }
+        } else if read == 1 {
+            let mut spin_count = 0;
+            loop {
+                // We need to allow the ref_count == 2 thread to have taken the remover before dealloc.
+                let remover = self.inner().remover.load(Acquire) as *mut u8;
+                if remover == TAKEN || remover.is_null() {
+                    // the null case happens when dropping a fresh instance due to DashMap insert race
+                    break;
+                }
+                // max spin count is taken from the pthread mutex implementation
+                spin_count += 1;
+                if spin_count < 100 {
+                    spin_loop(); // this is only a CPU hint that we’re waiting for a cache line to change
+                } else {
+                    spin_count = 0;
+                    #[cfg(feature = "println")]
+                    println!("spin {:p} {:p}", self, *self);
+                    yield_now(); // this makes a syscall to yield to another thread
+                }
+            }
+            #[cfg(feature = "println")]
+            println!("drop {:p} {:p}", self, *self);
 
-        let layout = Layout::for_value(self.inner());
-        unsafe {
-            // this is how you drop unsized values ...
-            drop_in_place(self.inner.as_ptr());
-            // and then we still have to free the memory
-            dealloc(self.inner.as_ptr() as *mut u8, layout);
+            // Final reference, do delete! We need to ensure that a previous drop on a different
+            // thread has stopped using the data (i.e. synchronise with the Release in fetch_sub).
+            assert!(self.inner().refs.load(Acquire) == 0);
+
+            let layout = Layout::for_value(self.inner());
+            unsafe {
+                // this is how you drop unsized values ...
+                drop_in_place(self.inner.as_ptr());
+                // and then we still have to free the memory
+                dealloc(self.inner.as_ptr() as *mut u8, layout);
+            }
         }
     }
 }

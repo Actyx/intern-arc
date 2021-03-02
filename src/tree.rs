@@ -13,7 +13,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-use crate::ref_count::{Interned, RemovalResult, RemovePtr};
+use crate::ref_count::{Interned, RemovePtr};
 use parking_lot::{Mutex, MutexGuard};
 use std::{
     collections::BTreeSet,
@@ -34,38 +34,23 @@ impl<T: ?Sized> Clone for InternOrd<T> {
 
 #[repr(C)]
 struct Inner<T: ?Sized> {
-    remove_if_last: RemovePtr<T>,
+    remover: RemovePtr<T>,
     map: Mutex<BTreeSet<Interned<T>>>,
 }
 
 unsafe impl<T: ?Sized + Sync + Send> Send for Inner<T> {}
 unsafe impl<T: ?Sized + Sync + Send> Sync for Inner<T> {}
 
-fn remove_if_last<T: ?Sized + Ord>(this: *const (), key: &Interned<T>) -> RemovalResult {
+fn remover<T: ?Sized + Ord>(this: *const (), key: &Interned<T>) {
     // this is safe because we’re still holding a weak reference: the value may be dropped
     // but the ArcInner is still alive!
     let weak = unsafe { Weak::from_raw(this as *const Inner<T>) };
-    match weak.upgrade() {
-        Some(strong) => {
-            let mut map = strong.map.lock();
-            if key.ref_count() == 2 {
-                map.remove(key);
-                // need to decrement this Arc’s weak count — can’t be done by Interned::Drop since it cannot know this type
-                drop(weak);
-                RemovalResult::Removed
-            } else {
-                // otherwise we need to keep the weak count because the caller will not drop the `this` pointer
-                // I prefer into_raw over forget because it clearly tells the Weak what is happening
-                Weak::into_raw(weak);
-                RemovalResult::NotRemoved
-            }
-        }
-        None => {
-            // This means that the last strong reference has started being dropped, so the map will be cleared.
-            // We drop the weak count because we won’t need to contact this interner anymore
-            drop(weak);
-            RemovalResult::MapGone
-        }
+    if let Some(strong) = weak.upgrade() {
+        let mut map = strong.map.lock();
+        let _value = map.take(key);
+        // drop the lock before dropping the value, in case the value has Drop glue that needs
+        // this lock
+        drop(map);
     }
 }
 
@@ -81,7 +66,7 @@ impl<T: ?Sized + Ord> InternOrd<T> {
     pub fn new() -> Self {
         Self {
             inner: Arc::new(Inner {
-                remove_if_last,
+                remover,
                 map: Mutex::new(BTreeSet::new()),
             }),
         }

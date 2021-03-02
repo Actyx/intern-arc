@@ -46,6 +46,16 @@
 //! interned at the same time.
 //!
 //! Nothing beats your own benchmarking, though.
+//!
+//! ## Caveat emptor!
+//!
+//! This crate’s [`Interned`](struct.Interned.html) type does not optimise equality using
+//! pointer comparisons because there is a race condition between dropping a value and
+//! interning that same value that will lead to “orphaned” instances (meaning that
+//! interning that same value again later will yield a different storage location).
+//! All similarly constructed interning implementations share this caveat (e.g.
+//! [`internment`](https://crates.io/crates/internment) or the above mentioned
+//! [`arc-interner`](https://crates.io/crates/arc-interner)).
 #![doc(html_logo_url = "https://developer.actyx.com/img/logo.svg")]
 #![doc(html_favicon_url = "https://developer.actyx.com/img/favicon.ico")]
 
