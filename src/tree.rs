@@ -41,13 +41,14 @@ struct Inner<T: ?Sized> {
 unsafe impl<T: ?Sized + Sync + Send> Send for Inner<T> {}
 unsafe impl<T: ?Sized + Sync + Send> Sync for Inner<T> {}
 
-fn remover<T: ?Sized + Ord>(this: *const (), key: &Interned<T>) {
+fn remover<T: ?Sized + Ord>(this: *const (), key: *const Interned<T>) {
     // this is safe because we’re still holding a weak reference: the value may be dropped
     // but the ArcInner is still alive!
     let weak = unsafe { Weak::from_raw(this as *const Inner<T>) };
     if let Some(strong) = weak.upgrade() {
         let mut map = strong.map.lock();
-        let _value = map.take(key);
+        // Please see Interned::drop() for an explanation why `key` is safe in this case
+        let _value = map.take(unsafe { &*key });
         // drop the lock before dropping the value, in case the value has Drop glue that needs
         // this lock
         drop(map);

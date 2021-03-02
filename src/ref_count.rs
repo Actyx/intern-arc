@@ -18,15 +18,13 @@ use std::{
     borrow::Borrow,
     fmt::{Debug, Display, Formatter, Pointer, Result},
     hash::{Hash, Hasher},
-    hint::spin_loop,
     intrinsics::drop_in_place,
     ops::Deref,
     ptr::NonNull,
     sync::atomic::{AtomicPtr, AtomicUsize, Ordering::*},
-    thread::yield_now,
 };
 
-pub(crate) type RemovePtr<T> = fn(*const (), &Interned<T>);
+pub(crate) type RemovePtr<T> = fn(*const (), *const Interned<T>);
 
 #[repr(C)]
 struct RefCounted<T: ?Sized> {
@@ -201,6 +199,7 @@ impl<T: ?Sized> Drop for Interned<T> {
 
         // decrement the count and read the value; the Release synchronises with an Acquire in case we deallocate
         let read = self.inner().refs.fetch_sub(1, Release);
+
         // two cases require action:
         //  - count was two: perform the removal (unless already done)
         //  - count was one: deallocate
@@ -208,50 +207,41 @@ impl<T: ?Sized> Drop for Interned<T> {
         #[cfg(feature = "println")]
         println!("read {} {:p} {:p}", read, self, *self);
 
-        if read == 2 {
-            // the other reference could be the map or external (if the map was dropped and we didn’t get here yet)
-            // so this races against:
-            //  1. map being dropped
-            //  2. same value being interned again
-            //  3. other external reference being dropped
-            // In the dropping cases, the other thread saw read == 1.
-            let remove_ptr = self.inner().remover.swap(TAKEN as *mut _, AcqRel);
-            if remove_ptr as *mut u8 != TAKEN {
-                #[cfg(feature = "println")]
-                println!("remover {:p} {:p}", self, *self);
-                // We’re the first to see ref_count 2, so drop the connection to the interner.
-                // There is a race here against concurrent interning of the same value or clone & drop
-                // of this value if the interner was dropped earlier. In both cases we leave the
-                // interner without this value, which in the first case means that a freshly interned
-                // and live value is now unknown to the interner — interning it again will yield a
-                // different RefCounted instance (which is why we can’t support pointer Eq).
-                let raw_arc = remove_ptr as *const ();
-                let remover = unsafe { *remove_ptr };
-                remover(raw_arc, self);
-            } else {
-                #[cfg(feature = "println")]
-                println!("second {:p} {:p}", self, *self);
-            }
-        } else if read == 1 {
-            let mut spin_count = 0;
-            loop {
-                // We need to allow the ref_count == 2 thread to have taken the remover before dealloc.
-                let remover = self.inner().remover.load(Acquire) as *mut u8;
-                if remover == TAKEN || remover.is_null() {
-                    // the null case happens when dropping a fresh instance due to DashMap insert race
-                    break;
-                }
-                // max spin count is taken from the pthread mutex implementation
-                spin_count += 1;
-                if spin_count < 100 {
-                    spin_loop(); // this is only a CPU hint that we’re waiting for a cache line to change
-                } else {
-                    spin_count = 0;
-                    #[cfg(feature = "println")]
-                    println!("spin {:p} {:p}", self, *self);
-                    yield_now(); // this makes a syscall to yield to another thread
-                }
-            }
+        if read > 2 {
+            return;
+        }
+
+        // the other reference could be the map or external (if the map was dropped and we didn’t get here yet)
+        // so this races against:
+        //  1. map being dropped
+        //  2. same value being interned again
+        //  3. other external reference being dropped
+        // In the dropping cases, the other thread saw read == 1.
+        let remove_ptr = self.inner().remover.swap(TAKEN as *mut _, AcqRel);
+        if remove_ptr as *mut u8 != TAKEN && !remove_ptr.is_null() {
+            #[cfg(feature = "println")]
+            println!("remover {:p} {:p}", self, *self);
+            // We’re the first to see ref_count 2, so drop the connection to the interner.
+            // There is a race here against concurrent interning of the same value or clone & drop
+            // of this value if the interner was dropped earlier. In both cases we leave the
+            // interner without this value, which in the first case means that a freshly interned
+            // and live value is now unknown to the interner — interning it again will yield a
+            // different RefCounted instance (which is why we can’t support pointer Eq).
+            let raw_arc = remove_ptr as *const ();
+            let remover = unsafe { *remove_ptr };
+            // If this thread saw read == 2 and another saw read == 1, didn’t get the remove_ptr,
+            // and proceeded with the deallocation before we get here, then passing the self
+            // reference is undefined behavior. OTOH, this can only happen if the interner has
+            // been dropped, because otherwise that other reference is in the interner and cannot
+            // concurrently be dropped. So we will only ever USE the self pointer when it is safe.
+            // (but this is why it cannot be &Interned<T>, it must be *const Interned<T>)
+            remover(raw_arc, self);
+        } else {
+            #[cfg(feature = "println")]
+            println!("second {:p} {:p}", self, *self);
+        }
+
+        if read == 1 {
             #[cfg(feature = "println")]
             println!("drop {:p} {:p}", self, *self);
 
