@@ -2,10 +2,10 @@
 name = "intern-arc"
 description = "An interner that deallocates unused values"
 homepage = "https://github.com/Actyx/intern-arc"
-version = "0.1.0"
+version = "0.2.0"
 authors = ["Actyx AG <developer@actyx.io>"]
 edition = "2018"
-license = "Apache-2.0"
+license = "Apache-2.0 OR MIT"
 readme = "README.md"
 repository = "https://github.com/Actyx/intern-arc"
 keywords = ["intern", "interner", "interning"]
@@ -13,3 +13,21 @@ keywords = ["intern", "interner", "interning"]
 [dependencies]
 dashmap = "3.11"
 once_cell = "1.3"
+parking_lot = "0.11.1"
+
+[profile.bench]
+lto = false
+debug = false # set to true when debugging sigsegv
+
+[[bench]]
+name = "bench"
+harness = false
+
+[dev-dependencies]
+criterion = "0.3.4"
+loom = "0.4.0"
+quickcheck = "1.0.3"
+
+[features]
+# turns on println debugging, useful when miri has found a problem
+println = []
