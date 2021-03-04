@@ -10,6 +10,12 @@ export MIRIFLAGS=-Zmiri-disable-isolation
 cargo +nightly miri test --features println -- --nocapture multithreading_hash
 ```
 
+Another very useful tool is [loom](https://docs.rs/loom), run it with
+
+```bash
+LOOM_LOG=1 LOOM_LOCATION=1 LOOM_CHECKPOINT_INTERVAL=1 RUST_BACKTRACE=1 RUSTFLAGS="--cfg loom" cargo test --lib
+```
+
 ## License
 
 At your option: Apache-2.0 or MIT

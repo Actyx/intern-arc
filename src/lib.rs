@@ -66,3 +66,29 @@ mod tree;
 pub use hash::InternHash;
 pub use ref_count::Interned;
 pub use tree::InternOrd;
+
+#[cfg(loom)]
+mod loom {
+    pub use ::loom::alloc::{alloc, dealloc, Layout};
+    pub use ::loom::sync::atomic::{spin_loop_hint, AtomicPtr, AtomicUsize, Ordering::*};
+    pub use ::loom::sync::MutexGuard;
+    pub use ::loom::thread::{current, yield_now};
+
+    pub struct Mutex<T>(::loom::sync::Mutex<T>);
+    impl<T> Mutex<T> {
+        pub fn new(t: T) -> Self {
+            Self(::loom::sync::Mutex::new(t))
+        }
+        pub fn lock(&self) -> MutexGuard<'_, T> {
+            self.0.lock().unwrap()
+        }
+    }
+}
+
+#[cfg(not(loom))]
+mod loom {
+    pub use parking_lot::{Mutex, MutexGuard};
+    pub use std::alloc::{alloc, dealloc, Layout};
+    pub use std::sync::atomic::{spin_loop_hint, AtomicPtr, AtomicUsize, Ordering::*};
+    pub use std::thread::{current, yield_now};
+}

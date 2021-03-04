@@ -13,14 +13,12 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+use crate::ref_count::{Interned, RemovePtr};
+use dashmap::DashMap;
 use std::{
     hash::Hash,
     sync::{Arc, Weak},
 };
-
-use dashmap::DashMap;
-
-use crate::ref_count::{Interned, RemovePtr};
 
 pub struct InternHash<T: ?Sized> {
     inner: Arc<Inner<T>>,
@@ -153,5 +151,95 @@ impl<T: ?Sized + Eq + Hash> InternHash<T> {
 impl<T: ?Sized + Eq + Hash> Default for InternHash<T> {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(all(test, loom))]
+mod tests {
+    use super::*;
+    use ::loom::{model, thread::spawn};
+
+    fn counts<T>(weak: Weak<T>) -> (usize, usize) {
+        // this is unfortunate: Arc does not allow querying weak_count once strong_count is zero
+        unsafe {
+            let ptr = &weak as *const _ as *const *const (usize, usize);
+            **ptr
+        }
+    }
+
+    #[test]
+    fn drop_interner() {
+        model(|| {
+            let i = InternHash::new();
+            let i2 = Arc::downgrade(&i.inner);
+
+            let n = i.intern_box(42.into());
+
+            let h = spawn(move || drop(i));
+            let h2 = spawn(move || drop(n));
+
+            h.join().unwrap();
+            h2.join().unwrap();
+
+            assert_eq!(counts(i2), (0, 1));
+        })
+    }
+
+    #[test]
+    fn drop_two_external() {
+        model(|| {
+            let i = InternHash::new();
+            let i2 = Arc::downgrade(&i.inner);
+
+            let n = i.intern_box(42.into());
+            let n2 = n.clone();
+            drop(i);
+
+            let h = spawn(move || drop(n));
+            let h2 = spawn(move || drop(n2));
+
+            h.join().unwrap();
+            h2.join().unwrap();
+
+            assert_eq!(counts(i2), (0, 1));
+        })
+    }
+
+    #[test]
+    fn drop_against_intern() {
+        model(|| {
+            let i = InternHash::new();
+            let i2 = Arc::downgrade(&i.inner);
+
+            let n = i.intern_box(42.into());
+
+            let h1 = spawn(move || drop(n));
+            let h2 = spawn(move || i.intern_box(42.into()));
+
+            h1.join().unwrap();
+            h2.join().unwrap();
+
+            assert_eq!(counts(i2), (0, 1));
+        })
+    }
+
+    #[test]
+    #[ignore]
+    // this test cannot work in loom because loom doesn’t see the synchronisation within DashMap
+    fn drop_against_intern_and_interner() {
+        model(|| {
+            let i = InternHash::new();
+            let i2 = Arc::downgrade(&i.inner);
+
+            let ii = i.clone();
+
+            let h2 = spawn(move || i.intern_box(42.into()));
+            let h3 = spawn(move || drop(ii));
+
+            h2.join().unwrap();
+            h3.join().unwrap();
+
+            assert_eq!(counts(i2), (0, 1));
+        })
     }
 }

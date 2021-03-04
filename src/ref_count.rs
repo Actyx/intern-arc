@@ -13,15 +13,14 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+use crate::loom::*;
 use std::{
-    alloc::{alloc, dealloc, Layout},
     borrow::Borrow,
     fmt::{Debug, Display, Formatter, Pointer, Result},
     hash::{Hash, Hasher},
     intrinsics::drop_in_place,
     ops::Deref,
     ptr::NonNull,
-    sync::atomic::{AtomicPtr, AtomicUsize, Ordering::*},
 };
 
 pub(crate) type RemovePtr<T> = fn(*const (), *const Interned<T>);
@@ -78,7 +77,10 @@ impl<T: ?Sized> RefCounted<T> {
                 );
                 // free the memory of the ex-Box; global allocator does not allow zero-sized allocations
                 // so this must be guarded by num_bytes > 0
+                #[cfg(not(loom))]
                 dealloc(b as *mut u8, Layout::for_value(&*b));
+                #[cfg(loom)]
+                std::alloc::dealloc(b as *mut u8, Layout::for_value(&*b));
             }
 
             NonNull::new_unchecked(ptr)
@@ -154,7 +156,7 @@ impl<T: ?Sized> Interned<T> {
     pub(crate) fn make_hot(&mut self, map: *mut RemovePtr<T>) -> bool {
         self.inner()
             .remover
-            .compare_exchange(std::ptr::null_mut(), map, Relaxed, Relaxed)
+            .compare_exchange(std::ptr::null_mut(), map, Release, Relaxed)
             .is_ok()
     }
 }
@@ -174,7 +176,7 @@ impl<T: ?Sized> Clone for Interned<T> {
         }
         let ret = Self { inner: self.inner };
         #[cfg(feature = "println")]
-        println!("clone {:p}", *self);
+        println!("{:?} clone {:p}", current().id(), *self);
         ret
     }
 }
@@ -184,7 +186,7 @@ impl<T: ?Sized> Drop for Interned<T> {
         // printing `self` to mark this particular execution (points to the stack)
         // printing `*self` to mark the interned value (as printed by `clone`)
         #[cfg(feature = "println")]
-        println!("dropping {:p} {:p}", self, *self);
+        println!("{:?} dropping {:p} {:p}", current().id(), self, *self);
 
         // preconditions:
         //  - this Interned may or may not be referenced by an interner (since the interner can be dropped)
@@ -205,45 +207,62 @@ impl<T: ?Sized> Drop for Interned<T> {
         //  - count was one: deallocate
 
         #[cfg(feature = "println")]
-        println!("read {} {:p} {:p}", read, self, *self);
+        println!("{:?} read {} {:p} {:p}", current().id(), read, self, *self);
 
         if read > 2 {
             return;
         }
 
-        // the other reference could be the map or external (if the map was dropped and we didn’t get here yet)
-        // so this races against:
-        //  1. map being dropped
-        //  2. same value being interned again
-        //  3. other external reference being dropped
-        // In the dropping cases, the other thread saw read == 1.
-        let remove_ptr = self.inner().remover.swap(TAKEN as *mut _, AcqRel);
-        if remove_ptr as *mut u8 != TAKEN && !remove_ptr.is_null() {
-            #[cfg(feature = "println")]
-            println!("remover {:p} {:p}", self, *self);
-            // We’re the first to see ref_count 2, so drop the connection to the interner.
-            // There is a race here against concurrent interning of the same value or clone & drop
-            // of this value if the interner was dropped earlier. In both cases we leave the
-            // interner without this value, which in the first case means that a freshly interned
-            // and live value is now unknown to the interner — interning it again will yield a
-            // different RefCounted instance (which is why we can’t support pointer Eq).
-            let raw_arc = remove_ptr as *const ();
-            let remover = unsafe { *remove_ptr };
-            // If this thread saw read == 2 and another saw read == 1, didn’t get the remove_ptr,
-            // and proceeded with the deallocation before we get here, then passing the self
-            // reference is undefined behavior. OTOH, this can only happen if the interner has
-            // been dropped, because otherwise that other reference is in the interner and cannot
-            // concurrently be dropped. So we will only ever USE the self pointer when it is safe.
-            // (but this is why it cannot be &Interned<T>, it must be *const Interned<T>)
-            remover(raw_arc, self);
-        } else {
-            #[cfg(feature = "println")]
-            println!("second {:p} {:p}", self, *self);
-        }
+        if read == 2 {
+            // the other reference could be the map or external (if the map was dropped and we didn’t get here yet)
+            // so this races against:
+            //  1. map being dropped
+            //  2. same value being interned again
+            //  3. other external reference being dropped
+            // In the dropping cases, the other thread saw read == 1.
+            let remove_ptr = self.inner().remover.swap(TAKEN as *mut _, Acquire);
+            if remove_ptr as *mut u8 != TAKEN {
+                #[cfg(feature = "println")]
+                println!("{:?} remover {:p} {:p}", current().id(), self, *self);
+                // We’re the first to see ref_count 2, so drop the connection to the interner.
+                // There is a race here against concurrent interning of the same value or clone & drop
+                // of this value if the interner was dropped earlier. In both cases we leave the
+                // interner without this value, which in the first case means that a freshly interned
+                // and live value is now unknown to the interner — interning it again will yield a
+                // different RefCounted instance (which is why we can’t support pointer Eq).
+                let raw_arc = remove_ptr as *const ();
+                let remover = unsafe { *remove_ptr };
+                // If this thread saw read == 2 and another saw read == 1, didn’t get the remove_ptr,
+                // and proceeded with the deallocation before we get here, then passing the self
+                // reference is undefined behavior. OTOH, this can only happen if the interner has
+                // been dropped, because otherwise that other reference is in the interner and cannot
+                // concurrently be dropped. So we will only ever USE the self pointer when it is safe.
+                // (but this is why it cannot be &Interned<T>, it must be *const Interned<T>)
+                remover(raw_arc, self);
+                #[cfg(feature = "println")]
+                println!("{:?} removed {:p} {:p}", current().id(), self, *self);
+            } else {
+                #[cfg(feature = "println")]
+                println!("{:?} second {:p} {:p}", current().id(), self, *self);
+            }
+        } else if read == 1 {
+            // we must wait until the thread that saw read == 2 has taken the remover
+            let mut spin_count = 0;
+            loop {
+                let p = self.inner().remover.load(Relaxed) as *mut u8;
+                if p == TAKEN || p.is_null() {
+                    break;
+                }
+                spin_count += 1;
+                if spin_count < 100 {
+                    spin_loop_hint(); // this is just a CPU hint that we’re waiting for a cache line to change
+                } else {
+                    yield_now(); // this is a syscall to ask the kernel to let another thread run
+                }
+            }
 
-        if read == 1 {
             #[cfg(feature = "println")]
-            println!("drop {:p} {:p}", self, *self);
+            println!("{:?} drop {:p} {:p}", current().id(), self, *self);
 
             // Final reference, do delete! We need to ensure that a previous drop on a different
             // thread has stopped using the data (i.e. synchronise with the Release in fetch_sub).
@@ -257,6 +276,9 @@ impl<T: ?Sized> Drop for Interned<T> {
                 dealloc(self.inner.as_ptr() as *mut u8, layout);
             }
         }
+
+        #[cfg(feature = "println")]
+        println!("{:?} dropend {:p} {:p}", current().id(), self, *self);
     }
 }
 
@@ -329,7 +351,7 @@ impl<T: ?Sized> Pointer for Interned<T> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(loom)))]
 mod tests {
     use crate::InternOrd;
 
