@@ -154,10 +154,19 @@ impl<T: ?Sized> Interned<T> {
     }
 
     pub(crate) fn make_hot(&mut self, map: *mut RemovePtr<T>) -> bool {
-        self.inner()
-            .remover
-            .compare_exchange(std::ptr::null_mut(), map, Release, Relaxed)
-            .is_ok()
+        let result =
+            self.inner()
+                .remover
+                .compare_exchange(std::ptr::null_mut(), map, Release, Relaxed);
+        #[cfg(test)]
+        {
+            if let Err(e) = result {
+                if e as *mut u8 == TAKEN {
+                    println!("{:?} spurious make_hot for {:p}", current().id(), *self);
+                }
+            }
+        }
+        result.is_ok()
     }
 }
 
@@ -240,10 +249,10 @@ impl<T: ?Sized> Drop for Interned<T> {
                 // (but this is why it cannot be &Interned<T>, it must be *const Interned<T>)
                 remover(raw_arc, self);
                 #[cfg(feature = "println")]
-                println!("{:?} removed {:p} {:p}", current().id(), self, *self);
+                println!("{:?} removed {:p}", current().id(), self);
             } else {
                 #[cfg(feature = "println")]
-                println!("{:?} second {:p} {:p}", current().id(), self, *self);
+                println!("{:?} second {:p}", current().id(), self);
             }
         } else if read == 1 {
             // we must wait until the thread that saw read == 2 has taken the remover
@@ -278,7 +287,7 @@ impl<T: ?Sized> Drop for Interned<T> {
         }
 
         #[cfg(feature = "println")]
-        println!("{:?} dropend {:p} {:p}", current().id(), self, *self);
+        println!("{:?} dropend {:p}", current().id(), self);
     }
 }
 
