@@ -13,9 +13,13 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-use crate::ref_count::{Interned, RemovePtr};
-use dashmap::DashMap;
+use crate::{
+    loom::*,
+    ref_count::{Interned, RemovePtr},
+};
 use std::{
+    borrow::Borrow,
+    collections::HashSet,
     hash::Hash,
     sync::{Arc, Weak},
 };
@@ -35,7 +39,16 @@ impl<T: ?Sized> Clone for InternHash<T> {
 #[repr(C)]
 struct Inner<T: ?Sized> {
     remover: RemovePtr<T>,
-    map: DashMap<Interned<T>, ()>,
+    set: RwLock<HashSet<Interned<T>>>,
+}
+
+#[cfg(loom)]
+impl<T: ?Sized> Drop for Inner<T> {
+    fn drop(&mut self) {
+        // This is needed to “see” interned values added from other threads in loom
+        // (since loom doesn’t provide Weak and therefore we cannot use its Arc).
+        self.set.read();
+    }
 }
 
 unsafe impl<T: ?Sized + Sync + Send> Send for Inner<T> {}
@@ -46,10 +59,16 @@ fn remover<T: ?Sized + Eq + Hash>(this: *const (), key: *const Interned<T>) {
     // but the ArcInner is still alive!
     let weak = unsafe { Weak::from_raw(this as *const Inner<T>) };
     if let Some(strong) = weak.upgrade() {
+        let mut set = strong.set.write();
+        #[cfg(loom)]
+        let mut set = set.unwrap();
         // need to bind the return value so that the map’s lock is released
         // before the value is dropped
         // Please see Interned::drop() for an explanation why `key` is safe in this case
-        let _value = strong.map.remove(unsafe { &*key });
+        let value = set.take(unsafe { &*key });
+        drop(set);
+        // drop value outside the lock
+        drop(value);
     }
 }
 
@@ -66,31 +85,54 @@ impl<T: ?Sized + Eq + Hash> InternHash<T> {
         Self {
             inner: Arc::new(Inner {
                 remover,
-                map: DashMap::new(),
+                set: RwLock::new(HashSet::new()),
             }),
         }
     }
 
     /// Returns the number of objects currently kept in this interner.
     pub fn len(&self) -> usize {
-        self.inner.map.len()
+        let set = self.inner.set.read();
+        #[cfg(loom)]
+        let set = set.unwrap();
+        set.len()
     }
 
     /// Returns `true` when this interner doesn’t hold any values.
     pub fn is_empty(&self) -> bool {
-        self.inner.map.is_empty()
+        let set = self.inner.set.read();
+        #[cfg(loom)]
+        let set = set.unwrap();
+        set.is_empty()
     }
 
-    fn intern(&self, interned: Interned<T>) -> Interned<T> {
-        // this method may be called even thought the entry is already in the map, cf. https://github.com/xacrimon/dashmap/issues/139
-        let entry = self.inner.map.entry(interned).or_insert(());
-        let mut ret = entry.key().clone();
-        drop(entry);
-        let me = Weak::into_raw(Arc::downgrade(&self.inner));
-        if !ret.make_hot(me as *mut RemovePtr<T>) {
-            // lost the race to install the weak reference, so we must properly drop it here
-            drop(unsafe { Weak::from_raw(me) });
+    fn intern<U, F>(&self, value: U, intern: F) -> Interned<T>
+    where
+        F: FnOnce(U) -> Interned<T>,
+        U: Borrow<T>,
+    {
+        #[cfg(not(loom))]
+        let set = self.inner.set.upgradable_read();
+        #[cfg(loom)]
+        let set = self.inner.set.read().unwrap();
+        if let Some(entry) = set.get(value.borrow()) {
+            return entry.clone();
         }
+        #[cfg(not(loom))]
+        let mut set = RwLockUpgradableReadGuard::upgrade(set);
+        #[cfg(loom)]
+        let mut set = {
+            drop(set);
+            self.inner.set.write().unwrap()
+        };
+        // check again with write lock to guard against concurrent insertion
+        if let Some(entry) = set.get(value.borrow()) {
+            return entry.clone();
+        }
+        let mut ret = intern(value);
+        let me = Weak::into_raw(Arc::downgrade(&self.inner));
+        ret.make_hot(me as *mut RemovePtr<T>);
+        set.insert(ret.clone());
         ret
     }
 
@@ -107,10 +149,7 @@ impl<T: ?Sized + Eq + Hash> InternHash<T> {
         T: ToOwned,
         T::Owned: Into<Box<T>>,
     {
-        if let Some(entry) = self.inner.map.get(value) {
-            return entry.key().clone();
-        }
-        self.intern(Interned::from_box(value.to_owned().into()))
+        self.intern(value, |v| Interned::from_box(v.to_owned().into()))
     }
 
     /// Intern a value from an owned reference without allocating new memory for it.
@@ -124,10 +163,7 @@ impl<T: ?Sized + Eq + Hash> InternHash<T> {
     /// ```
     /// (This also works nicely with a `String` that can be turned `.into()` a `Box`.)
     pub fn intern_box(&self, value: Box<T>) -> Interned<T> {
-        if let Some(entry) = self.inner.map.get(value.as_ref()) {
-            return entry.key().clone();
-        }
-        self.intern(Interned::from_box(value))
+        self.intern(value, Interned::from_box)
     }
 
     /// Intern a sized value, allocating heap memory for it.
@@ -141,10 +177,7 @@ impl<T: ?Sized + Eq + Hash> InternHash<T> {
     where
         T: Sized,
     {
-        if let Some(entry) = self.inner.map.get(&value) {
-            return entry.key().clone();
-        }
-        self.intern(Interned::from_sized(value))
+        self.intern(value, Interned::from_sized)
     }
 }
 
@@ -224,18 +257,19 @@ mod tests {
     }
 
     #[test]
-    #[ignore]
-    // this test cannot work in loom because loom doesn’t see the synchronisation within DashMap
     fn drop_against_intern_and_interner() {
         model(|| {
             let i = InternHash::new();
             let i2 = Arc::downgrade(&i.inner);
 
+            let n = i.intern_box(42.into());
             let ii = i.clone();
 
+            let h1 = spawn(move || drop(n));
             let h2 = spawn(move || i.intern_box(42.into()));
             let h3 = spawn(move || drop(ii));
 
+            h1.join().unwrap();
             h2.join().unwrap();
             h3.join().unwrap();
 

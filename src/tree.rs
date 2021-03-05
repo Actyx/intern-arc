@@ -18,6 +18,7 @@ use crate::{
     ref_count::{Interned, RemovePtr},
 };
 use std::{
+    borrow::Borrow,
     collections::BTreeSet,
     sync::{Arc, Weak},
 };
@@ -37,7 +38,7 @@ impl<T: ?Sized> Clone for InternOrd<T> {
 #[repr(C)]
 struct Inner<T: ?Sized> {
     remover: RemovePtr<T>,
-    map: Mutex<BTreeSet<Interned<T>>>,
+    set: RwLock<BTreeSet<Interned<T>>>,
 }
 
 #[cfg(loom)]
@@ -45,7 +46,7 @@ impl<T: ?Sized> Drop for Inner<T> {
     fn drop(&mut self) {
         // This is needed to “see” interned values added from other threads in loom
         // (since loom doesn’t provide Weak and therefore we cannot use its Arc).
-        self.map.lock();
+        self.set.read();
     }
 }
 
@@ -57,12 +58,14 @@ fn remover<T: ?Sized + Ord>(this: *const (), key: *const Interned<T>) {
     // but the ArcInner is still alive!
     let weak = unsafe { Weak::from_raw(this as *const Inner<T>) };
     if let Some(strong) = weak.upgrade() {
-        let mut map = strong.map.lock();
+        let mut set = strong.set.write();
+        #[cfg(loom)]
+        let mut set = set.unwrap();
         // Please see Interned::drop() for an explanation why `key` is safe in this case
-        let _value = map.take(unsafe { &*key });
-        // drop the lock before dropping the value, in case the value has Drop glue that needs
-        // this lock
-        drop(map);
+        let value = set.take(unsafe { &*key });
+        drop(set);
+        // drop the value outside the lock
+        drop(value);
     }
 }
 
@@ -79,34 +82,54 @@ impl<T: ?Sized + Ord> InternOrd<T> {
         Self {
             inner: Arc::new(Inner {
                 remover,
-                map: Mutex::new(BTreeSet::new()),
+                set: RwLock::new(BTreeSet::new()),
             }),
         }
     }
 
-    fn map(&self) -> MutexGuard<BTreeSet<Interned<T>>> {
-        self.inner.map.lock()
-    }
-
     /// Returns the number of objects currently kept in this interner.
     pub fn len(&self) -> usize {
-        self.map().len()
+        let set = self.inner.set.read();
+        #[cfg(loom)]
+        let set = set.unwrap();
+        set.len()
     }
 
     /// Returns `true` when this interner doesn’t hold any values.
     pub fn is_empty(&self) -> bool {
-        self.map().is_empty()
+        let set = self.inner.set.read();
+        #[cfg(loom)]
+        let set = set.unwrap();
+        set.is_empty()
     }
 
-    fn intern(
-        &self,
-        mut map: MutexGuard<BTreeSet<Interned<T>>>,
-        interned: Interned<T>,
-    ) -> Interned<T> {
-        let mut ret = interned.clone();
-        map.insert(interned);
+    fn intern<U, F>(&self, value: U, intern: F) -> Interned<T>
+    where
+        F: FnOnce(U) -> Interned<T>,
+        U: Borrow<T>,
+    {
+        #[cfg(not(loom))]
+        let set = self.inner.set.upgradable_read();
+        #[cfg(loom)]
+        let set = self.inner.set.read().unwrap();
+        if let Some(entry) = set.get(value.borrow()) {
+            return entry.clone();
+        }
+        #[cfg(not(loom))]
+        let mut set = RwLockUpgradableReadGuard::upgrade(set);
+        #[cfg(loom)]
+        let mut set = {
+            drop(set);
+            self.inner.set.write().unwrap()
+        };
+        // check again with write lock to guard against concurrent insertion
+        if let Some(entry) = set.get(value.borrow()) {
+            return entry.clone();
+        }
+        let mut ret = intern(value);
         let me = Weak::into_raw(Arc::downgrade(&self.inner));
         ret.make_hot(me as *mut RemovePtr<T>);
+        set.insert(ret.clone());
         ret
     }
 
@@ -123,11 +146,7 @@ impl<T: ?Sized + Ord> InternOrd<T> {
         T: ToOwned,
         T::Owned: Into<Box<T>>,
     {
-        let map = self.map();
-        if let Some(entry) = map.get(value) {
-            return entry.clone();
-        }
-        self.intern(map, Interned::from_box(value.to_owned().into()))
+        self.intern(value, |v| Interned::from_box(v.to_owned().into()))
     }
 
     /// Intern a value from an owned reference without allocating new memory for it.
@@ -141,11 +160,7 @@ impl<T: ?Sized + Ord> InternOrd<T> {
     /// ```
     /// (This also works nicely with a `String` that can be turned `.into()` a `Box`.)
     pub fn intern_box(&self, value: Box<T>) -> Interned<T> {
-        let map = self.map();
-        if let Some(entry) = map.get(value.as_ref()) {
-            return entry.clone();
-        }
-        self.intern(map, Interned::from_box(value))
+        self.intern(value, Interned::from_box)
     }
 
     /// Intern a sized value, allocating heap memory for it.
@@ -159,11 +174,7 @@ impl<T: ?Sized + Ord> InternOrd<T> {
     where
         T: Sized,
     {
-        let map = self.map();
-        if let Some(entry) = map.get(&value) {
-            return entry.clone();
-        }
-        self.intern(map, Interned::from_sized(value))
+        self.intern(value, Interned::from_sized)
     }
 }
 

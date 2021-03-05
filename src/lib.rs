@@ -36,7 +36,8 @@
 //!
 //! The same API is provided in two flavors:
 //!
-//!  - [`InternHash`](struct.InternHash.html) uses hash-based storage, namely a [`DashMap`](https://docs.rs/dashmap)
+//!  - [`InternHash`](struct.InternHash.html) uses hash-based storage, namely the standard
+//!    [`HashSet`](https://doc.rust-lang.org/std/collections/struct.HashSet.html)
 //!  - [`InternOrd`](struct.InternOrd.html) uses ord-based storage, namely the standard
 //!    [`BTreeSet`](https://doc.rust-lang.org/std/collections/struct.BTreeSet.html)
 //!
@@ -71,23 +72,13 @@ pub use tree::InternOrd;
 mod loom {
     pub use ::loom::alloc::{alloc, dealloc, Layout};
     pub use ::loom::sync::atomic::{spin_loop_hint, AtomicPtr, AtomicUsize, Ordering::*};
-    pub use ::loom::sync::MutexGuard;
+    pub use ::loom::sync::RwLock;
     pub use ::loom::thread::{current, yield_now};
-
-    pub struct Mutex<T>(::loom::sync::Mutex<T>);
-    impl<T> Mutex<T> {
-        pub fn new(t: T) -> Self {
-            Self(::loom::sync::Mutex::new(t))
-        }
-        pub fn lock(&self) -> MutexGuard<'_, T> {
-            self.0.lock().unwrap()
-        }
-    }
 }
 
 #[cfg(not(loom))]
 mod loom {
-    pub use parking_lot::{Mutex, MutexGuard};
+    pub use parking_lot::{RwLock, RwLockUpgradableReadGuard};
     pub use std::alloc::{alloc, dealloc, Layout};
     pub use std::hint::spin_loop as spin_loop_hint;
     pub use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering::*};

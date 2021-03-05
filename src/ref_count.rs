@@ -173,8 +173,7 @@ impl<T: ?Sized> Interned<T> {
 // use the two upper bits as spin-wait conditions
 const MAX_REFCOUNT: usize = usize::MAX - 2;
 
-// cannot use null: spurious `get` failure in DashMap may lead to another make_hot
-// which we prevent by using a non-null marker when taking the removal function
+// The remover starts out as NULL, then points to the interner’s Inner struct, then to TAKEN
 const TAKEN: *mut u8 = std::mem::align_of::<RemovePtr<()>>() as *mut _;
 
 impl<T: ?Sized> Clone for Interned<T> {
