@@ -18,9 +18,7 @@
 //! This library differs from [`arc-interner`](https://crates.io/crates/arc-interner)
 //! (which served as initial inspiration) in that
 //!
-//!  - it contains no static global state (interners must be created and can be dropped;
-//!    you can use [`OnceCell`](https://docs.rs/once_cell) or [`lazy_static!`](https://docs.rs/lazy_static)
-//!    to manage global instances)
+//!  - interners must be created and can be dropped (for convenience functions see below)
 //!  - it does not dispatch based on TypeId (each interner is for exactly one type)
 //!  - it offers both [`Hash`](https://doc.rust-lang.org/std/hash/trait.Hash.html)-based
 //!    and [`Ord`](https://doc.rust-lang.org/std/cmp/trait.Ord.html)-based storage
@@ -31,14 +29,16 @@
 //! from the standard library’s [`Arc`](https://doc.rust-lang.org/std/sync/struct.Arc.html) type.
 //! Additionally, the test suite passes also under [miri](https://github.com/rust-lang/miri) to
 //! check against some classes of undefined behavior in the unsafe code (including memory leaks).
+//! Dedicated tests are in place employing [`loom`](https://docs.rs/loom) to verify adherence
+//! to the Rust memory model.
 //!
 //! ## API flavors
 //!
 //! The same API is provided in two flavors:
 //!
-//!  - [`InternHash`](struct.InternHash.html) uses hash-based storage, namely the standard
+//!  - [`HashInterner`](struct.HashInterner.html) uses hash-based storage, namely the standard
 //!    [`HashSet`](https://doc.rust-lang.org/std/collections/struct.HashSet.html)
-//!  - [`InternOrd`](struct.InternOrd.html) uses ord-based storage, namely the standard
+//!  - [`OrdInterner`](struct.OrdInterner.html) uses ord-based storage, namely the standard
 //!    [`BTreeSet`](https://doc.rust-lang.org/std/collections/struct.BTreeSet.html)
 //!
 //! Interning small values takes of the order of 100–200ns on a typical server CPU. The ord-based
@@ -47,6 +47,33 @@
 //! interned at the same time.
 //!
 //! Nothing beats your own benchmarking, though.
+//!
+//! ## Convenience access to interners
+//!
+//! When employing interning for example within a dedicated deserialiser thread, it is best to create
+//! and locally use an interner, avoiding further synchronisation overhead. You can also store interners
+//! in thread-local variables if you only care about deduplication per thread.
+//!
+//! That said, this crate also provides convenience functions based on a global type-indexed pool:
+//!
+//! ```
+//! use intern_arc::{global::hash_interner, Interned};
+//!
+//! let i1 = hash_interner().intern_ref("hello"); // -> Interned<str>
+//! let i2 = hash_interner().intern_sized(vec![1, 2, 3]); // -> Interned<Vec<i32>>
+//! # use std::any::{Any, TypeId}; // using TypeId to avoid influencing type interence
+//! # assert_eq!(i1.type_id(), TypeId::of::<Interned<str>>());
+//! # assert_eq!(i2.type_id(), TypeId::of::<Interned<Vec<i32>>>());
+//! ```
+//!
+//! You can also use the type-indexed pool yourself to control its lifetime:
+//!
+//! ```
+//! use intern_arc::{global::OrdInternerPool, Interned};
+//!
+//! let mut pool = OrdInternerPool::new();
+//! let i: Interned<[u8]> = pool.get_or_create().intern_box(vec![1, 2, 3].into());
+//! ```
 //!
 //! ## Caveat emptor!
 //!
@@ -60,13 +87,14 @@
 #![doc(html_logo_url = "https://developer.actyx.com/img/logo.svg")]
 #![doc(html_favicon_url = "https://developer.actyx.com/img/favicon.ico")]
 
+pub mod global;
 mod hash;
 mod ref_count;
 mod tree;
 
-pub use hash::InternHash;
+pub use hash::HashInterner;
 pub use ref_count::Interned;
-pub use tree::InternOrd;
+pub use tree::OrdInterner;
 
 #[cfg(loom)]
 mod loom {

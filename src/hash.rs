@@ -24,11 +24,11 @@ use std::{
     sync::{Arc, Weak},
 };
 
-pub struct InternHash<T: ?Sized> {
+pub struct HashInterner<T: ?Sized> {
     inner: Arc<Inner<T>>,
 }
 
-impl<T: ?Sized> Clone for InternHash<T> {
+impl<T: ?Sized> Clone for HashInterner<T> {
     fn clone(&self) -> Self {
         Self {
             inner: self.inner.clone(),
@@ -80,7 +80,7 @@ fn remover<T: ?Sized + Eq + Hash>(this: *const (), key: *const Interned<T>) {
 /// release all references to the interned values it has created that are still live.
 /// Those values remain fully operational until dropped. Memory for the values
 /// themselves is freed for each value individually once its last reference is dropped.
-impl<T: ?Sized + Eq + Hash> InternHash<T> {
+impl<T: ?Sized + Eq + Hash> HashInterner<T> {
     pub fn new() -> Self {
         Self {
             inner: Arc::new(Inner {
@@ -139,9 +139,9 @@ impl<T: ?Sized + Eq + Hash> InternHash<T> {
     /// Intern a value from a shared reference by allocating new memory for it.
     ///
     /// ```
-    /// use intern_arc::{InternHash, Interned};
+    /// use intern_arc::{HashInterner, Interned};
     ///
-    /// let strings = InternHash::<str>::new();
+    /// let strings = HashInterner::<str>::new();
     /// let i: Interned<str> = strings.intern_ref("hello world!");
     /// ```
     pub fn intern_ref(&self, value: &T) -> Interned<T>
@@ -155,9 +155,9 @@ impl<T: ?Sized + Eq + Hash> InternHash<T> {
     /// Intern a value from an owned reference without allocating new memory for it.
     ///
     /// ```
-    /// use intern_arc::{InternHash, Interned};
+    /// use intern_arc::{HashInterner, Interned};
     ///
-    /// let strings = InternHash::<str>::new();
+    /// let strings = HashInterner::<str>::new();
     /// let hello: Box<str> = "hello world!".into();
     /// let i: Interned<str> = strings.intern_box(hello);
     /// ```
@@ -169,9 +169,9 @@ impl<T: ?Sized + Eq + Hash> InternHash<T> {
     /// Intern a sized value, allocating heap memory for it.
     ///
     /// ```
-    /// use intern_arc::{InternHash, Interned};
+    /// use intern_arc::{HashInterner, Interned};
     ///
-    /// let arrays = InternHash::<[u8; 1000]>::new();
+    /// let arrays = HashInterner::<[u8; 1000]>::new();
     /// let i: Interned<[u8; 1000]> = arrays.intern_sized([0; 1000]);
     pub fn intern_sized(&self, value: T) -> Interned<T>
     where
@@ -181,7 +181,7 @@ impl<T: ?Sized + Eq + Hash> InternHash<T> {
     }
 }
 
-impl<T: ?Sized + Eq + Hash> Default for InternHash<T> {
+impl<T: ?Sized + Eq + Hash> Default for HashInterner<T> {
     fn default() -> Self {
         Self::new()
     }
@@ -203,7 +203,7 @@ mod tests {
     #[test]
     fn drop_interner() {
         model(|| {
-            let i = InternHash::new();
+            let i = HashInterner::new();
             let i2 = Arc::downgrade(&i.inner);
 
             let n = i.intern_box(42.into());
@@ -221,7 +221,7 @@ mod tests {
     #[test]
     fn drop_two_external() {
         model(|| {
-            let i = InternHash::new();
+            let i = HashInterner::new();
             let i2 = Arc::downgrade(&i.inner);
 
             let n = i.intern_box(42.into());
@@ -241,7 +241,7 @@ mod tests {
     #[test]
     fn drop_against_intern() {
         model(|| {
-            let i = InternHash::new();
+            let i = HashInterner::new();
             let i2 = Arc::downgrade(&i.inner);
 
             let n = i.intern_box(42.into());
@@ -259,7 +259,7 @@ mod tests {
     #[test]
     fn drop_against_intern_and_interner() {
         model(|| {
-            let i = InternHash::new();
+            let i = HashInterner::new();
             let i2 = Arc::downgrade(&i.inner);
 
             let n = i.intern_box(42.into());

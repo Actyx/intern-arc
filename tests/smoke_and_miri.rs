@@ -19,14 +19,14 @@ use std::thread;
 // Test basic functionality.
 #[test]
 fn basic_hash() {
-    let interner = InternHash::<&str>::new();
+    let interner = HashInterner::<&str>::new();
 
     assert_eq!(interner.intern_sized("foo"), interner.intern_sized("foo"));
     assert_ne!(interner.intern_sized("foo"), interner.intern_sized("bar"));
     // The above refs should be deallocated by now.
     assert_eq!(interner.len(), 0);
 
-    let interner = InternHash::<String>::new();
+    let interner = HashInterner::<String>::new();
 
     let interned1 = interner.intern_sized("foo".to_string());
     {
@@ -49,7 +49,7 @@ fn basic_hash() {
 // Test basic functionality.
 #[test]
 fn basic_hash_unsized() {
-    let interner = InternHash::<str>::new();
+    let interner = HashInterner::<str>::new();
 
     assert_eq!(interner.intern_ref("foo"), interner.intern_ref("foo"));
     assert_ne!(interner.intern_ref("foo"), interner.intern_ref("bar"));
@@ -79,7 +79,7 @@ fn basic_hash_unsized() {
 
     assert_ne!(
         &*interned1 as *const _,
-        &*InternHash::new().intern_ref("foo") as *const _
+        &*HashInterner::new().intern_ref("foo") as *const _
     );
 
     assert_eq!(interned1.ref_count(), 1);
@@ -88,14 +88,14 @@ fn basic_hash_unsized() {
 // Test basic functionality.
 #[test]
 fn basic_ord() {
-    let interner = InternOrd::<&str>::new();
+    let interner = OrdInterner::<&str>::new();
 
     assert_eq!(interner.intern_sized("foo"), interner.intern_sized("foo"));
     assert_ne!(interner.intern_sized("foo"), interner.intern_sized("bar"));
     // The above refs should be deallocated by now.
     assert_eq!(interner.len(), 0);
 
-    let interner = InternOrd::<String>::new();
+    let interner = OrdInterner::<String>::new();
 
     let interned1 = interner.intern_sized("foo".to_string());
     {
@@ -118,7 +118,7 @@ fn basic_ord() {
 // Test basic functionality.
 #[test]
 fn basic_ord_unsized() {
-    let interner = InternOrd::<str>::new();
+    let interner = OrdInterner::<str>::new();
 
     assert_eq!(interner.intern_ref("foo"), interner.intern_ref("foo"));
     assert_ne!(interner.intern_ref("foo"), interner.intern_ref("bar"));
@@ -148,7 +148,7 @@ fn basic_ord_unsized() {
 
     assert_ne!(
         &*interned1 as *const _,
-        &*InternOrd::new().intern_ref("foo") as *const _
+        &*OrdInterner::new().intern_ref("foo") as *const _
     );
 
     assert_eq!(interned1.ref_count(), 1);
@@ -158,7 +158,7 @@ fn basic_ord_unsized() {
 // Also tests `Display` implementation.
 #[test]
 fn sorting() {
-    let interner = InternHash::new();
+    let interner = HashInterner::new();
     let mut interned_vals = vec![
         interner.intern_sized(4),
         interner.intern_sized(2),
@@ -177,7 +177,7 @@ pub struct TestStruct(String, u64);
 
 #[test]
 fn sequential_hash() {
-    let interner = InternHash::new();
+    let interner = HashInterner::new();
 
     for _i in 0..10 {
         let mut interned = Vec::with_capacity(100);
@@ -191,7 +191,7 @@ fn sequential_hash() {
 
 #[test]
 fn sequential_ord() {
-    let interner = InternOrd::new();
+    let interner = OrdInterner::new();
 
     for _i in 0..10 {
         let mut interned = Vec::with_capacity(100);
@@ -207,7 +207,7 @@ fn sequential_ord() {
 // multiple threads.
 #[test]
 fn multithreading_hash() {
-    let interner = InternHash::new();
+    let interner = HashInterner::new();
 
     let mut thandles = vec![];
     for _i in 0..3 {
@@ -235,7 +235,7 @@ fn multithreading_hash() {
 // multiple threads.
 #[test]
 fn multithreading_ord() {
-    let interner = InternOrd::new();
+    let interner = OrdInterner::new();
 
     let mut thandles = vec![];
     for _i in 0..3 {

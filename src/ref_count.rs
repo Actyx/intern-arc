@@ -361,11 +361,11 @@ impl<T: ?Sized> Pointer for Interned<T> {
 
 #[cfg(all(test, not(loom)))]
 mod tests {
-    use crate::InternOrd;
+    use crate::OrdInterner;
 
     #[test]
     fn pointer() {
-        let interner = InternOrd::new();
+        let interner = OrdInterner::new();
         let i = interner.intern_sized(42);
         let i2 = i.clone();
         assert_eq!(format!("{:p}", i), format!("{:p}", i2));
