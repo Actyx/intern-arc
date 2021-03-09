@@ -108,7 +108,6 @@ mod loom {
 mod loom {
     pub use parking_lot::{RwLock, RwLockUpgradableReadGuard};
     pub use std::alloc::{alloc, dealloc, Layout};
-    pub use std::hint::spin_loop as spin_loop_hint;
-    pub use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering::*};
+    pub use std::sync::atomic::{spin_loop_hint, AtomicPtr, AtomicUsize, Ordering::*};
     pub use std::thread::{current, yield_now};
 }
