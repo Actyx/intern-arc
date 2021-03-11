@@ -14,7 +14,9 @@
  * limitations under the License.
  */
 use crate::loom::*;
+use parking_lot::lock_api::RawMutex;
 use std::{
+    cell::UnsafeCell,
     fmt::{Formatter, Pointer, Result},
     ops::Deref,
     ptr::NonNull,
@@ -37,16 +39,50 @@ impl Interner for () {
     }
 }
 
-struct State<I: Interner> {
+#[repr(C)]
+struct State<I> {
+    // inlining the raw mutex manually here to bring overhead down from 24 to 16 bytes
+    // on 64bit platforms (which unfortunately implies writing our own `struct Guard`)
+    mutex: parking_lot::RawMutex,
     /// 4 billion refs ought to be enough for anybody, plus this allows the RawMutex
     /// to live inside the same word on 64bit architectures.
-    refs: u32,
-    cleanup: Option<Weak<I>>,
+    refs: UnsafeCell<u32>,
+    cleanup: UnsafeCell<Option<Weak<I>>>,
+}
+impl<I: Interner> State<I> {
+    pub fn new() -> Self {
+        Self {
+            mutex: parking_lot::RawMutex::INIT,
+            refs: UnsafeCell::new(1),
+            cleanup: UnsafeCell::new(None),
+        }
+    }
+    pub fn lock(&self) -> Guard<I> {
+        self.mutex.lock();
+        Guard(self)
+    }
+}
+struct Guard<'a, I>(&'a State<I>);
+impl<'a, I> Guard<'a, I> {
+    pub fn refs(&self) -> u32 {
+        unsafe { *self.0.refs.get() }
+    }
+    pub fn refs_mut(&mut self) -> &mut u32 {
+        unsafe { &mut *self.0.refs.get() }
+    }
+    pub fn cleanup(&mut self) -> &mut Option<Weak<I>> {
+        unsafe { &mut *self.0.cleanup.get() }
+    }
+}
+impl<'a, I> Drop for Guard<'a, I> {
+    fn drop(&mut self) {
+        unsafe { self.0.mutex.unlock() };
+    }
 }
 
 #[repr(C)]
 struct RefCounted<I: Interner> {
-    state: Mutex<State<I>>,
+    state: State<I>,
     value: I::T,
 }
 
@@ -72,13 +108,7 @@ impl<I: Interner> RefCounted<I> {
                 temp
             };
             // write the fields
-            std::ptr::write(
-                &mut (*ptr).state,
-                Mutex::new(State {
-                    refs: 1,
-                    cleanup: None,
-                }),
-            );
+            std::ptr::write(&mut (*ptr).state, State::new());
             let num_bytes = std::mem::size_of_val(&*b);
             if num_bytes > 0 {
                 std::ptr::copy_nonoverlapping(
@@ -104,10 +134,7 @@ impl<I: Interner> RefCounted<I> {
         I::T: Sized,
     {
         let b = Box::new(Self {
-            state: Mutex::new(State {
-                refs: 1,
-                cleanup: None,
-            }),
+            state: State::new(),
             value,
         });
         NonNull::from(Box::leak(b))
@@ -141,10 +168,10 @@ impl<I: Interner> Interned<I> {
     /// which produced this reference has been dropped; in this case you are still free to
     /// use this reference in any way you like.
     pub fn ref_count(&self) -> u32 {
-        self.lock().refs
+        self.lock().refs()
     }
 
-    fn lock(&self) -> MutexGuard<State<I>> {
+    fn lock(&self) -> Guard<I> {
         // this is safe since the existence of &self proves that the pointer is still valid
         unsafe { self.inner.as_ref().state.lock() }
     }
@@ -166,7 +193,7 @@ impl<I: Interner> Interned<I> {
 
     pub(crate) fn make_hot(&mut self, set: &Arc<I>) {
         let mut state = self.lock();
-        state.cleanup = Some(Arc::downgrade(set));
+        *state.cleanup() = Some(Arc::downgrade(set));
     }
 }
 
@@ -176,8 +203,8 @@ const MAX_REFCOUNT: u32 = u32::MAX - 2;
 impl<I: Interner> Clone for Interned<I> {
     fn clone(&self) -> Self {
         let mut state = self.lock();
-        let previous = state.refs;
-        state.refs += 1;
+        let previous = state.refs();
+        *state.refs_mut() += 1;
         drop(state);
         if previous >= MAX_REFCOUNT {
             // the below misspelling is deliberate
@@ -215,30 +242,30 @@ impl<I: Interner> Drop for Interned<I> {
         println!(
             "{:?} read {} {:p} {:p}",
             current().id(),
-            state.refs,
+            state.refs(),
             self,
             *self
         );
 
         // decrement the count and read the value
-        state.refs -= 1;
+        *state.refs_mut() -= 1;
 
         // two cases require action:
         //  - count was two: perform the removal (unless already done)
         //  - count was one: deallocate
 
-        if state.refs > 1 {
+        if state.refs() > 1 {
             return;
         }
 
-        if state.refs == 1 {
+        if state.refs() == 1 {
             // the other reference could be the map or external (if the map was dropped and we didn’t get here yet)
             // so this races against:
             //  1. map being dropped
             //  2. same value being interned again
             //  3. other external reference being dropped
             // In the dropping cases, the other thread saw read == 1.
-            if let Some(cleanup) = state.cleanup.take() {
+            if let Some(cleanup) = state.cleanup().take() {
                 #[cfg(feature = "println")]
                 println!("{:?} removing {:p} {:p}", current().id(), self, *self);
                 // At this point, the other remaining reference can either be the interner or an
@@ -258,9 +285,9 @@ impl<I: Interner> Drop for Interned<I> {
                         } else {
                             // someone interfered, so we need to take the lock again to put things in order
                             let mut state = self.lock();
-                            if state.refs > 1 {
+                            if state.refs() > 1 {
                                 // someone else will drop the refs to one later
-                                state.cleanup = Some(cleanup);
+                                *state.cleanup() = Some(cleanup);
                                 break;
                             } else {
                                 // whoever interfered already dropped their reference again, so we need to retry
@@ -278,7 +305,7 @@ impl<I: Interner> Drop for Interned<I> {
                 #[cfg(feature = "println")]
                 println!("{:?} cleanup gone {:p}", current().id(), self);
             }
-        } else if state.refs == 0 {
+        } else if state.refs() == 0 {
             #[cfg(feature = "println")]
             println!("{:?} drop {:p} {:p}", current().id(), self, *self);
 
@@ -310,6 +337,7 @@ impl<I: Interner> Pointer for Interned<I> {
 
 #[cfg(all(test, not(loom)))]
 mod tests {
+    use super::*;
     use crate::OrdInterner;
 
     #[test]
@@ -318,5 +346,12 @@ mod tests {
         let i = interner.intern_sized(42);
         let i2 = i.clone();
         assert_eq!(format!("{:p}", i), format!("{:p}", i2));
+    }
+
+    #[test]
+    fn size() {
+        use std::mem::size_of;
+        const SIZE: usize = if size_of::<usize>() == 4 { 12 } else { 16 };
+        assert_eq!(size_of::<RefCounted<()>>(), SIZE);
     }
 }
