@@ -15,36 +15,43 @@
  */
 use crate::loom::*;
 use std::{
-    borrow::Borrow,
-    fmt::{Debug, Display, Formatter, Pointer, Result},
-    hash::{Hash, Hasher},
-    intrinsics::drop_in_place,
+    fmt::{Formatter, Pointer, Result},
     ops::Deref,
     ptr::NonNull,
+    sync::{Arc, Weak},
 };
 
-pub(crate) type RemovePtr<T> = fn(*const (), *const Interned<T>);
-
-#[repr(C)]
-struct RefCounted<T: ?Sized> {
-    /// number of references held to this value, including the one from the interner map
-    ///
-    /// highest bit stores whether the remove_if_lsat pointer has been consumed
-    refs: AtomicUsize,
-    /// Pointer to the location of a function pointer that can remove a given
-    /// Interned<T> from the interner map. This same pointer is also provided
-    /// as the first argument to the remove_if_last function in order to find
-    /// the interner state in memory, so use #[repr(C)] and put the function
-    /// pointer first!
-    ///
-    /// The function must remove the value from the interner and drop the
-    /// weak reference to the pointed-to location.
-    remover: AtomicPtr<RemovePtr<T>>,
-    value: T,
+/// This type must be sized so that we can be sure of the memory layout
+/// and therefore the pointer width. This allows the Interned< I> to not
+/// have the Interner as a type parameter: it just stores a pointer that
+/// we then cast appropriately in `inner()`.
+pub trait Interner: Sized {
+    type T: ?Sized;
+    fn remove(&self, value: &Interned<Self>) -> (bool, Option<Interned<Self>>);
+}
+/// This is a bogus shim impl used only for being able to compute the size of a RefCounted structure.
+impl Interner for () {
+    type T = ();
+    fn remove(&self, _value: &Interned<Self>) -> (bool, Option<Interned<Self>>) {
+        (false, None)
+    }
 }
 
-impl<T: ?Sized> RefCounted<T> {
-    fn from_box(value: Box<T>) -> NonNull<Self> {
+struct State<I: Interner> {
+    /// 4 billion refs ought to be enough for anybody, plus this allows the RawMutex
+    /// to live inside the same word on 64bit architectures.
+    refs: u32,
+    cleanup: Option<Weak<I>>,
+}
+
+#[repr(C)]
+struct RefCounted<I: Interner> {
+    state: Mutex<State<I>>,
+    value: I::T,
+}
+
+impl<I: Interner> RefCounted<I> {
+    fn from_box(value: Box<I::T>) -> NonNull<Self> {
         // figure out the needed allocation size — this requires #[repr(C)]
         let layout = Layout::new::<RefCounted<()>>()
             .extend(Layout::for_value(value.as_ref()))
@@ -56,7 +63,7 @@ impl<T: ?Sized> RefCounted<T> {
             let ptr = alloc(layout);
             // get value pointer with the right metadata (e.g. string length)
             // while making sure to NOT DROP THE BOX
-            let b = Box::leak(value) as *mut T;
+            let b = Box::leak(value) as *mut I::T;
             // construct correct (fat) pointer from allocation result
             let ptr = {
                 let mut temp = b as *mut Self;
@@ -65,8 +72,13 @@ impl<T: ?Sized> RefCounted<T> {
                 temp
             };
             // write the fields
-            (*ptr).refs = AtomicUsize::new(1);
-            (*ptr).remover = AtomicPtr::new(std::ptr::null_mut());
+            std::ptr::write(
+                &mut (*ptr).state,
+                Mutex::new(State {
+                    refs: 1,
+                    cleanup: None,
+                }),
+            );
             let num_bytes = std::mem::size_of_val(&*b);
             if num_bytes > 0 {
                 std::ptr::copy_nonoverlapping(
@@ -87,25 +99,27 @@ impl<T: ?Sized> RefCounted<T> {
         }
     }
 
-    fn from_sized(value: T) -> NonNull<Self>
+    fn from_sized(value: I::T) -> NonNull<Self>
     where
-        T: Sized,
+        I::T: Sized,
     {
         let b = Box::new(Self {
-            refs: AtomicUsize::new(1),
-            remover: AtomicPtr::new(std::ptr::null_mut()),
+            state: Mutex::new(State {
+                refs: 1,
+                cleanup: None,
+            }),
             value,
         });
         NonNull::from(Box::leak(b))
     }
 }
 
-pub struct Interned<T: ?Sized> {
-    inner: NonNull<RefCounted<T>>,
+pub struct Interned<I: Interner> {
+    inner: NonNull<RefCounted<I>>,
 }
 
-unsafe impl<T: ?Sized + Sync + Send> Send for Interned<T> {}
-unsafe impl<T: ?Sized + Sync + Send> Sync for Interned<T> {}
+unsafe impl<I: Interner> Send for Interned<I> where I::T: Send + Sync + 'static {}
+unsafe impl<I: Interner> Sync for Interned<I> where I::T: Send + Sync + 'static {}
 
 /// An interned value
 ///
@@ -120,65 +134,52 @@ unsafe impl<T: ?Sized + Sync + Send> Sync for Interned<T> {}
 /// instances. (`Interned` keeps a [`Weak`](https://doc.rust-lang.org/std/sync/struct.Weak.html)
 /// reference to the interner that created it, so it will prevent the `ArcInner` from being
 /// deallocated while it lives.)
-impl<T: ?Sized> Interned<T> {
-    /// Obtain current number of references, including this one, using
-    /// [`Ordering::Relaxed`](https://doc.rust-lang.org/std/sync/atomic/enum.Ordering.html#variant.Relaxed).
-    /// This means that reads and writes of your code may be freely reordered around this
-    /// read, there is no synchronisation with other threads.
+impl<I: Interner> Interned<I> {
+    /// Obtain current number of references, including this one.
     ///
     /// The value will always be at least 1. If the value is 1, this means that the interner
     /// which produced this reference has been dropped; in this case you are still free to
     /// use this reference in any way you like.
-    pub fn ref_count(&self) -> usize {
-        self.inner().refs.load(Relaxed)
+    pub fn ref_count(&self) -> u32 {
+        self.lock().refs
     }
 
-    fn inner(&self) -> &RefCounted<T> {
+    fn lock(&self) -> MutexGuard<State<I>> {
         // this is safe since the existence of &self proves that the pointer is still valid
-        unsafe { self.inner.as_ref() }
+        unsafe { self.inner.as_ref().state.lock() }
     }
 
-    pub(crate) fn from_box(value: Box<T>) -> Self {
+    pub(crate) fn from_box(value: Box<I::T>) -> Self {
         Self {
             inner: RefCounted::from_box(value),
         }
     }
 
-    pub(crate) fn from_sized(value: T) -> Self
+    pub(crate) fn from_sized(value: I::T) -> Self
     where
-        T: Sized,
+        I::T: Sized,
     {
         Self {
             inner: RefCounted::from_sized(value),
         }
     }
 
-    pub(crate) fn make_hot(&mut self, map: *mut RemovePtr<T>) -> bool {
-        let result =
-            self.inner()
-                .remover
-                .compare_exchange(std::ptr::null_mut(), map, Release, Relaxed);
-        #[cfg(test)]
-        {
-            if let Err(e) = result {
-                if e as *mut u8 == TAKEN {
-                    println!("{:?} spurious make_hot for {:p}", current().id(), *self);
-                }
-            }
-        }
-        result.is_ok()
+    pub(crate) fn make_hot(&mut self, set: &Arc<I>) {
+        let mut state = self.lock();
+        state.cleanup = Some(Arc::downgrade(set));
     }
 }
 
 // use the two upper bits as spin-wait conditions
-const MAX_REFCOUNT: usize = usize::MAX - 2;
+const MAX_REFCOUNT: u32 = u32::MAX - 2;
 
-// The remover starts out as NULL, then points to the interner’s Inner struct, then to TAKEN
-const TAKEN: *mut u8 = std::mem::align_of::<RemovePtr<()>>() as *mut _;
-
-impl<T: ?Sized> Clone for Interned<T> {
+impl<I: Interner> Clone for Interned<I> {
     fn clone(&self) -> Self {
-        if self.inner().refs.fetch_add(1, Relaxed) >= MAX_REFCOUNT {
+        let mut state = self.lock();
+        let previous = state.refs;
+        state.refs += 1;
+        drop(state);
+        if previous >= MAX_REFCOUNT {
             // the below misspelling is deliberate
             panic!("either you are running on an 8086 or you are leaking Interned values at a phantastic rate");
         }
@@ -189,7 +190,7 @@ impl<T: ?Sized> Clone for Interned<T> {
     }
 }
 
-impl<T: ?Sized> Drop for Interned<T> {
+impl<I: Interner> Drop for Interned<I> {
     fn drop(&mut self) {
         // printing `self` to mark this particular execution (points to the stack)
         // printing `*self` to mark the interned value (as printed by `clone`)
@@ -203,86 +204,89 @@ impl<T: ?Sized> Drop for Interned<T> {
         //  - if the only remaining reference is the interner map, we need to try to remove it
         //    (this races against an `intern` call for the same value and against dropping the interner)
         //
-        // IMPORTANT NOTE: each Interned starts out with two references!
+        // IMPORTANT NOTE: each Interned starts out with two references! (by virtue of creation and first clone)
         //
         // Also, THE REMOVAL POINTER NEEDS TO BE USED EXACTLY ONCE!
 
-        // decrement the count and read the value; the Release synchronises with an Acquire in case we deallocate
-        let read = self.inner().refs.fetch_sub(1, Release);
+        // take the lock — we MUST NOT hold this lock while calling the cleanup function!
+        let mut state = self.lock();
+
+        #[cfg(feature = "println")]
+        println!(
+            "{:?} read {} {:p} {:p}",
+            current().id(),
+            state.refs,
+            self,
+            *self
+        );
+
+        // decrement the count and read the value
+        state.refs -= 1;
 
         // two cases require action:
         //  - count was two: perform the removal (unless already done)
         //  - count was one: deallocate
 
-        #[cfg(feature = "println")]
-        println!("{:?} read {} {:p} {:p}", current().id(), read, self, *self);
-
-        if read > 2 {
+        if state.refs > 1 {
             return;
         }
 
-        if read == 2 {
+        if state.refs == 1 {
             // the other reference could be the map or external (if the map was dropped and we didn’t get here yet)
             // so this races against:
             //  1. map being dropped
             //  2. same value being interned again
             //  3. other external reference being dropped
             // In the dropping cases, the other thread saw read == 1.
-            let remove_ptr = self.inner().remover.swap(TAKEN as *mut _, Acquire);
-            if remove_ptr as *mut u8 != TAKEN {
+            if let Some(cleanup) = state.cleanup.take() {
                 #[cfg(feature = "println")]
-                println!("{:?} remover {:p} {:p}", current().id(), self, *self);
-                // We’re the first to see ref_count 2, so drop the connection to the interner.
-                // There is a race here against concurrent interning of the same value or clone & drop
-                // of this value if the interner was dropped earlier. In both cases we leave the
-                // interner without this value, which in the first case means that a freshly interned
-                // and live value is now unknown to the interner — interning it again will yield a
-                // different RefCounted instance (which is why we can’t support pointer Eq).
-                let raw_arc = remove_ptr as *const ();
-                let remover = unsafe { *remove_ptr };
-                // If this thread saw read == 2 and another saw read == 1, didn’t get the remove_ptr,
-                // and proceeded with the deallocation before we get here, then passing the self
-                // reference is undefined behavior. OTOH, this can only happen if the interner has
-                // been dropped, because otherwise that other reference is in the interner and cannot
-                // concurrently be dropped. So we will only ever USE the self pointer when it is safe.
-                // (but this is why it cannot be &Interned<T>, it must be *const Interned<T>)
-                remover(raw_arc, self);
+                println!("{:?} removing {:p} {:p}", current().id(), self, *self);
+                // At this point, the other remaining reference can either be the interner or an
+                // external one (if the interner was already dropped).
+                if let Some(strong) = cleanup.upgrade() {
+                    // Interner is still there, so the other reference is in there; we may race
+                    // against interning of the same value, which may already have taken the interner
+                    // lock, so we cannot just call the cleanup function.
+                    drop(state);
+                    loop {
+                        // in here another thread may have found the interned reference and started cloning it,
+                        // it might even have dropped it already (but without running cleanup, since we have that)
+                        let (removed, _value) = strong.remove(self);
+                        if removed {
+                            // nobody interfered and the value is now removed from the interner, we can safely drop it
+                            break;
+                        } else {
+                            // someone interfered, so we need to take the lock again to put things in order
+                            let mut state = self.lock();
+                            if state.refs > 1 {
+                                // someone else will drop the refs to one later
+                                state.cleanup = Some(cleanup);
+                                break;
+                            } else {
+                                // whoever interfered already dropped their reference again, so we need to retry
+                            }
+                        }
+                    }
+                } else {
+                    // Interner is gone or on its way out, which means that no concurrent interning
+                    // is possible anymore; it also means that the other reference may well be from
+                    // the interner, still (it may be dropping right now). Our job here is done.
+                }
                 #[cfg(feature = "println")]
                 println!("{:?} removed {:p}", current().id(), self);
             } else {
                 #[cfg(feature = "println")]
-                println!("{:?} second {:p}", current().id(), self);
+                println!("{:?} cleanup gone {:p}", current().id(), self);
             }
-        } else if read == 1 {
-            // we must wait until the thread that saw read == 2 has taken the remover
-            let mut spin_count = 0;
-            loop {
-                let p = self.inner().remover.load(Relaxed) as *mut u8;
-                if p == TAKEN || p.is_null() {
-                    break;
-                }
-                spin_count += 1;
-                if spin_count < 100 {
-                    spin_loop_hint(); // this is just a CPU hint that we’re waiting for a cache line to change
-                } else {
-                    yield_now(); // this is a syscall to ask the kernel to let another thread run
-                }
-            }
-
+        } else if state.refs == 0 {
             #[cfg(feature = "println")]
             println!("{:?} drop {:p} {:p}", current().id(), self, *self);
 
-            // Final reference, do delete! We need to ensure that a previous drop on a different
-            // thread has stopped using the data (i.e. synchronise with the Release in fetch_sub).
-            assert!(self.inner().refs.load(Acquire) == 0);
+            // drop the lock before freeing the memory
+            drop(state);
 
-            let layout = Layout::for_value(self.inner());
-            unsafe {
-                // this is how you drop unsized values ...
-                drop_in_place(self.inner.as_ptr());
-                // and then we still have to free the memory
-                dealloc(self.inner.as_ptr() as *mut u8, layout);
-            }
+            // since we created the pointer with Box::leak(), we can recreate the box to drop it
+            unsafe { Box::from_raw(self.inner.as_ptr()) };
         }
 
         #[cfg(feature = "println")]
@@ -290,72 +294,17 @@ impl<T: ?Sized> Drop for Interned<T> {
     }
 }
 
-impl<T: ?Sized + PartialEq> PartialEq for Interned<T> {
-    fn eq(&self, other: &Self) -> bool {
-        self.inner().value.eq(&other.inner().value)
-    }
-}
-impl<T: ?Sized + Eq> Eq for Interned<T> {}
-
-impl<T: ?Sized + PartialOrd> PartialOrd for Interned<T> {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        self.inner().value.partial_cmp(&other.inner().value)
-    }
-}
-impl<T: ?Sized + Ord> Ord for Interned<T> {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.inner().value.cmp(&other.inner().value)
-    }
-}
-
-impl<T: ?Sized + Hash> Hash for Interned<T> {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.inner().value.hash(state)
-    }
-}
-
-impl<T: ?Sized> Borrow<T> for Interned<T> {
-    fn borrow(&self) -> &T {
-        &self.inner().value
-    }
-}
-
-// The following would be nice, but it clashes with the Borrow<T> for T blanket impl
-// impl<T: ?Sized + Borrow<X>, X: ?Sized> Borrow<X> for Interned<T> {
-//     fn borrow(&self) -> &T {
-//         &self.inner().value.borrow()
-//     }
-// }
-
-impl<T: ?Sized> Deref for Interned<T> {
-    type Target = T;
+impl<I: Interner> Deref for Interned<I> {
+    type Target = I::T;
 
     fn deref(&self) -> &Self::Target {
-        self.borrow()
+        &unsafe { self.inner.as_ref() }.value
     }
 }
 
-impl<T: ?Sized> AsRef<T> for Interned<T> {
-    fn as_ref(&self) -> &T {
-        self.deref()
-    }
-}
-
-impl<T: ?Sized + Debug> Debug for Interned<T> {
+impl<I: Interner> Pointer for Interned<I> {
     fn fmt(&self, f: &mut Formatter<'_>) -> Result {
-        write!(f, "Interned({:?})", &*self)
-    }
-}
-
-impl<T: ?Sized + Display> Display for Interned<T> {
-    fn fmt(&self, f: &mut Formatter<'_>) -> Result {
-        self.deref().fmt(f)
-    }
-}
-
-impl<T: ?Sized> Pointer for Interned<T> {
-    fn fmt(&self, f: &mut Formatter<'_>) -> Result {
-        Pointer::fmt(&(&**self as *const T), f)
+        Pointer::fmt(&(&**self as *const I::T), f)
     }
 }
 

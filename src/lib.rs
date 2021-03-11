@@ -57,22 +57,23 @@
 //! That said, this crate also provides convenience functions based on a global type-indexed pool:
 //!
 //! ```
-//! use intern_arc::{global::hash_interner, Interned};
+//! use intern_arc::{global::hash_interner};
 //!
-//! let i1 = hash_interner().intern_ref("hello"); // -> Interned<str>
-//! let i2 = hash_interner().intern_sized(vec![1, 2, 3]); // -> Interned<Vec<i32>>
+//! let i1 = hash_interner().intern_ref("hello"); // -> InternedHash<str>
+//! let i2 = hash_interner().intern_sized(vec![1, 2, 3]); // -> InternedHash<Vec<i32>>
 //! # use std::any::{Any, TypeId}; // using TypeId to avoid influencing type interence
-//! # assert_eq!(i1.type_id(), TypeId::of::<Interned<str>>());
-//! # assert_eq!(i2.type_id(), TypeId::of::<Interned<Vec<i32>>>());
+//! # use intern_arc::InternedHash;
+//! # assert_eq!(i1.type_id(), TypeId::of::<InternedHash<str>>());
+//! # assert_eq!(i2.type_id(), TypeId::of::<InternedHash<Vec<i32>>>());
 //! ```
 //!
 //! You can also use the type-indexed pool yourself to control its lifetime:
 //!
 //! ```
-//! use intern_arc::{global::OrdInternerPool, Interned};
+//! use intern_arc::{global::OrdInternerPool, InternedOrd};
 //!
 //! let mut pool = OrdInternerPool::new();
-//! let i: Interned<[u8]> = pool.get_or_create().intern_box(vec![1, 2, 3].into());
+//! let i: InternedOrd<[u8]> = pool.get_or_create().intern_box(vec![1, 2, 3].into());
 //! ```
 //!
 //! ## Caveat emptor!
@@ -92,22 +93,42 @@ mod hash;
 mod ref_count;
 mod tree;
 
-pub use hash::HashInterner;
-pub use ref_count::Interned;
-pub use tree::OrdInterner;
+pub use hash::{HashInterner, InternedHash};
+pub use tree::{InternedOrd, OrdInterner};
+
+pub mod mode {
+    pub use crate::hash::Hash;
+    pub use crate::tree::Ord;
+}
 
 #[cfg(loom)]
 mod loom {
-    pub use ::loom::alloc::{alloc, dealloc, Layout};
-    pub use ::loom::sync::atomic::{spin_loop_hint, AtomicPtr, AtomicUsize, Ordering::*};
-    pub use ::loom::sync::RwLock;
-    pub use ::loom::thread::{current, yield_now};
+    pub use ::loom::{
+        alloc::{alloc, dealloc, Layout},
+        sync::{
+            atomic::{spin_loop_hint, AtomicPtr, AtomicUsize, Ordering::*},
+            MutexGuard, RwLock,
+        },
+        thread::{current, yield_now},
+    };
+
+    pub struct Mutex<T>(::loom::sync::Mutex<T>);
+    impl<T> Mutex<T> {
+        pub fn new(t: T) -> Self {
+            Self(::loom::sync::Mutex::new(t))
+        }
+        pub fn lock(&self) -> MutexGuard<'_, T> {
+            self.0.lock().unwrap()
+        }
+    }
 }
 
 #[cfg(not(loom))]
 mod loom {
-    pub use parking_lot::{RwLock, RwLockUpgradableReadGuard};
-    pub use std::alloc::{alloc, dealloc, Layout};
-    pub use std::sync::atomic::{spin_loop_hint, AtomicPtr, AtomicUsize, Ordering::*};
-    pub use std::thread::{current, yield_now};
+    pub use parking_lot::{Mutex, MutexGuard, RwLock, RwLockUpgradableReadGuard};
+    pub use std::{
+        alloc::{alloc, dealloc, Layout},
+        sync::atomic::{spin_loop_hint, AtomicPtr, AtomicUsize, Ordering::*},
+        thread::{current, yield_now},
+    };
 }
