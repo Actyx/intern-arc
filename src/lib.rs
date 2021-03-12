@@ -96,11 +96,6 @@ mod tree;
 pub use hash::{HashInterner, InternedHash};
 pub use tree::{InternedOrd, OrdInterner};
 
-pub mod mode {
-    pub use crate::hash::Hash;
-    pub use crate::tree::Ord;
-}
-
 #[cfg(loom)]
 mod loom {
     pub use ::loom::{

@@ -39,7 +39,6 @@ impl Interner for () {
     }
 }
 
-#[repr(C)]
 struct State<I> {
     // inlining the raw mutex manually here to bring overhead down from 24 to 16 bytes
     // on 64bit platforms (which unfortunately implies writing our own `struct Guard`)
@@ -353,5 +352,28 @@ mod tests {
         use std::mem::size_of;
         const SIZE: usize = if size_of::<usize>() == 4 { 12 } else { 16 };
         assert_eq!(size_of::<RefCounted<()>>(), SIZE);
+
+        let fake = RefCounted::<crate::hash::Hash<i32>> {
+            state: State::new(),
+            value: 42,
+        };
+
+        println!("base:  {:p}", &fake);
+        let base = &fake as *const _ as *const u8;
+        println!("state: {:p} (base + {})", &fake.state, unsafe {
+            (&fake.state as *const _ as *const u8).offset_from(base)
+        });
+        println!("mutex: {:p} (base + {})", &fake.state.mutex, unsafe {
+            (&fake.state.mutex as *const _ as *const u8).offset_from(base)
+        });
+        println!("refs:  {:p} (base + {})", &fake.state.refs, unsafe {
+            (&fake.state.refs as *const _ as *const u8).offset_from(base)
+        });
+        println!("clean: {:p} (base + {})", &fake.state.cleanup, unsafe {
+            (&fake.state.cleanup as *const _ as *const u8).offset_from(base)
+        });
+        println!("value: {:p} (base + {})", &fake.value, unsafe {
+            (&fake.value as *const _ as *const u8).offset_from(base)
+        });
     }
 }
