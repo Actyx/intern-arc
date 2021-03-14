@@ -19,6 +19,7 @@ use crate::{
 };
 use std::{
     borrow::Borrow,
+    cmp::Ordering,
     collections::HashSet,
     fmt::{Debug, Display, Formatter, Pointer},
     hash::Hasher,
@@ -26,6 +27,16 @@ use std::{
     sync::Arc,
 };
 
+/// Interner for hashable values
+///
+/// The interner is cheaply cloneable by virtue of keeping the underlying storage
+/// in an [`Arc`](https://doc.rust-lang.org/std/sync/struct.Arc.html). Once the last
+/// reference to this interner is dropped, it will clear its backing storage and
+/// release all references to the interned values it has created that are still live.
+/// Those values remain fully operational until dropped. Memory for the values
+/// themselves is freed for each value individually once its last reference is dropped.
+/// The interner’s ArcInner memory will only be deallocated once the last interned
+/// value has been dropped (this is less than hundred bytes).
 pub struct HashInterner<T: ?Sized + Eq + std::hash::Hash> {
     inner: Arc<Hash<T>>,
 }
@@ -76,14 +87,6 @@ impl<T: ?Sized + Eq + std::hash::Hash> Interner for Hash<T> {
     }
 }
 
-/// Interner for hashable values
-///
-/// The interner is cheaply cloneable by virtue of keeping the underlying storage
-/// in an [`Arc`](https://doc.rust-lang.org/std/sync/struct.Arc.html). Once the last
-/// reference to this interner is dropped, it will clear its backing storage and
-/// release all references to the interned values it has created that are still live.
-/// Those values remain fully operational until dropped. Memory for the values
-/// themselves is freed for each value individually once its last reference is dropped.
 impl<T: ?Sized + Eq + std::hash::Hash> HashInterner<T> {
     pub fn new() -> Self {
         Self {
@@ -191,10 +194,27 @@ impl<T: ?Sized + Eq + std::hash::Hash> Default for HashInterner<T> {
     }
 }
 
+/// An interned value
+///
+/// This type works very similar to an [`Arc`](https://doc.rust-lang.org/std/sync/struct.Arc.html)
+/// with the difference that it has no concept of weak references. They are not needed because
+/// **interned values must not be modified**, so reference cycles cannot be constructed. One
+/// reference is held by the interner that created this value as long as that interner lives.
+///
+/// Keeping interned values around does not keep the interner alive: once the last reference to
+/// the interner is dropped, it will release its existing references to interned values by
+/// dropping its set implementation. Only the direct allocation size of the set implementation
+/// remains allocated (but no longer functional) until the last weak reference to the interner
+/// goes away — each interned value keeps one such weak reference to its interner.
 #[repr(transparent)] // this is important to cast references
 pub struct InternedHash<T: ?Sized + Eq + std::hash::Hash>(Interned<Hash<T>>);
 
 impl<T: ?Sized + Eq + std::hash::Hash> InternedHash<T> {
+    /// Obtain current number of references, including this one.
+    ///
+    /// The value will always be at least 1. If the value is 1, this means that the interner
+    /// which produced this reference has been dropped; in this case you are still free to
+    /// use this reference in any way you like.
     pub fn ref_count(&self) -> u32 {
         self.0.ref_count()
     }
@@ -217,7 +237,8 @@ where
     T: PartialEq,
 {
     fn eq(&self, other: &Self) -> bool {
-        self.deref().eq(other.deref())
+        // equal pointer means same interner and same contents
+        self.0 == other.0 || self.deref().eq(other.deref())
     }
 }
 impl<T: ?Sized + Eq + std::hash::Hash> Eq for InternedHash<T> where T: Eq {}
@@ -226,7 +247,10 @@ impl<T: ?Sized + Eq + std::hash::Hash> PartialOrd for InternedHash<T>
 where
     T: PartialOrd,
 {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        if self.0 == other.0 {
+            return Some(Ordering::Equal);
+        }
         self.deref().partial_cmp(other.deref())
     }
 }
@@ -234,7 +258,10 @@ impl<T: ?Sized + Eq + std::hash::Hash> Ord for InternedHash<T>
 where
     T: Ord,
 {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+    fn cmp(&self, other: &Self) -> Ordering {
+        if self.0 == other.0 {
+            return Ordering::Equal;
+        }
         self.deref().cmp(other.deref())
     }
 }
@@ -303,6 +330,12 @@ mod tests {
         let i2 = i.clone();
         assert_eq!(format!("{:p}", i), format!("{:p}", i2));
     }
+}
+
+#[test]
+fn size() {
+    let s = std::mem::size_of::<Hash<()>>();
+    assert!(s < 100, "too big: {}", s);
 }
 
 #[cfg(all(test, loom))]

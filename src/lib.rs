@@ -19,18 +19,21 @@
 //! (which served as initial inspiration) in that
 //!
 //!  - interners must be created and can be dropped (for convenience functions see below)
-//!  - it does not dispatch based on TypeId (each interner is for exactly one type)
+//!  - it does not dispatch based on [`TypeId`](https://doc.rust-lang.org/std/any/struct.TypeId.html)
+//!    (each interner is for exactly one type)
 //!  - it offers both [`Hash`](https://doc.rust-lang.org/std/hash/trait.Hash.html)-based
 //!    and [`Ord`](https://doc.rust-lang.org/std/cmp/trait.Ord.html)-based storage
-//!  - it handles unsized types without overhead, so you should use `Intern<str>` instead of `Intern<String>`
+//!  - it handles unsized types without overhead, so you should inline
+//!    [`str`](https://doc.rust-lang.org/std/primitive.str.html) instead of
+//!    [`String`](https://doc.rust-lang.org/std/string/struct.String.html)
 //!
 //! Unfortunately, this combination of features makes it inevitable to use unsafe Rust.
-//! The handling of reference counting and constructing of unsized values has been adapted
-//! from the standard library’s [`Arc`](https://doc.rust-lang.org/std/sync/struct.Arc.html) type.
-//! Additionally, the test suite passes also under [miri](https://github.com/rust-lang/miri) to
+//! The construction of unsized values has been adapted from the standard library’s
+//! [`Arc`](https://doc.rust-lang.org/std/sync/struct.Arc.html) type; reference counting
+//! employs a [`parking_lot`](https://docs.rs/parking_lot) mutex since it must also ensure
+//! consistent access to and usage of the cleanup function that will remove the value from its interner.
+//! The test suite passes also under [miri](https://github.com/rust-lang/miri) to
 //! check against some classes of undefined behavior in the unsafe code (including memory leaks).
-//! Dedicated tests are in place employing [`loom`](https://docs.rs/loom) to verify adherence
-//! to the Rust memory model.
 //!
 //! ## API flavors
 //!
@@ -75,16 +78,6 @@
 //! let mut pool = OrdInternerPool::new();
 //! let i: InternedOrd<[u8]> = pool.get_or_create().intern_box(vec![1, 2, 3].into());
 //! ```
-//!
-//! ## Caveat emptor!
-//!
-//! This crate’s [`Interned`](struct.Interned.html) type does not optimise equality using
-//! pointer comparisons because there is a race condition between dropping a value and
-//! interning that same value that will lead to “orphaned” instances (meaning that
-//! interning that same value again later will yield a different storage location).
-//! All similarly constructed interning implementations share this caveat (e.g.
-//! [`internment`](https://crates.io/crates/internment) or the above mentioned
-//! [`arc-interner`](https://crates.io/crates/arc-interner)).
 #![doc(html_logo_url = "https://developer.actyx.com/img/logo.svg")]
 #![doc(html_favicon_url = "https://developer.actyx.com/img/favicon.ico")]
 

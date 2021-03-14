@@ -19,6 +19,7 @@ use crate::{
 };
 use std::{
     borrow::Borrow,
+    cmp::Ordering,
     collections::BTreeSet,
     fmt::{Debug, Display, Formatter, Pointer},
     hash::Hasher,
@@ -26,6 +27,16 @@ use std::{
     sync::Arc,
 };
 
+/// Interner for values with a total order
+///
+/// The interner is cheaply cloneable by virtue of keeping the underlying storage
+/// in an [`Arc`](https://doc.rust-lang.org/std/sync/struct.Arc.html). Once the last
+/// reference to this interner is dropped, it will clear its backing storage and
+/// release all references to the interned values it has created that are still live.
+/// Those values remain fully operational until dropped. Memory for the values
+/// themselves is freed for each value individually once its last reference is dropped.
+/// The interner’s ArcInner memory will only be deallocated once the last interned
+/// value has been dropped (this is less than hundred bytes).
 pub struct OrdInterner<T: ?Sized + std::cmp::Ord> {
     inner: Arc<Ord<T>>,
 }
@@ -63,7 +74,6 @@ impl<T: ?Sized + std::cmp::Ord> Interner for Ord<T> {
         let mut set = self.set.write();
         #[cfg(loom)]
         let mut set = set.unwrap();
-        // Please see Interned::drop() for an explanation why `key` is safe in this case
         if let Some(i) = set.take(value) {
             if i.ref_count() == 1 {
                 (true, Some(i.0))
@@ -77,14 +87,6 @@ impl<T: ?Sized + std::cmp::Ord> Interner for Ord<T> {
     }
 }
 
-/// Interner for values with a total order
-///
-/// The interner is cheaply cloneable by virtue of keeping the underlying storage
-/// in an [`Arc`](https://doc.rust-lang.org/std/sync/struct.Arc.html). Once the last
-/// reference to this interner is dropped, it will clear its backing storage and
-/// release all references to the interned values it has created that are still live.
-/// Those values remain fully operational until dropped. Memory for the values
-/// themselves is freed for each value individually once its last reference is dropped.
 impl<T: ?Sized + std::cmp::Ord> OrdInterner<T> {
     pub fn new() -> Self {
         Self {
@@ -192,10 +194,27 @@ impl<T: ?Sized + std::cmp::Ord> Default for OrdInterner<T> {
     }
 }
 
+/// An interned value
+///
+/// This type works very similar to an [`Arc`](https://doc.rust-lang.org/std/sync/struct.Arc.html)
+/// with the difference that it has no concept of weak references. They are not needed because
+/// **interned values must not be modified**, so reference cycles cannot be constructed. One
+/// reference is held by the interner that created this value as long as that interner lives.
+///
+/// Keeping interned values around does not keep the interner alive: once the last reference to
+/// the interner is dropped, it will release its existing references to interned values by
+/// dropping its set implementation. Only the direct allocation size of the set implementation
+/// remains allocated (but no longer functional) until the last weak reference to the interner
+/// goes away — each interned value keeps one such weak reference to its interner.
 #[repr(transparent)] // this is important to cast references
 pub struct InternedOrd<T: ?Sized + std::cmp::Ord>(Interned<Ord<T>>);
 
 impl<T: ?Sized + std::cmp::Ord> InternedOrd<T> {
+    /// Obtain current number of references, including this one.
+    ///
+    /// The value will always be at least 1. If the value is 1, this means that the interner
+    /// which produced this reference has been dropped; in this case you are still free to
+    /// use this reference in any way you like.
     pub fn ref_count(&self) -> u32 {
         self.0.ref_count()
     }
@@ -218,7 +237,8 @@ where
     T: PartialEq,
 {
     fn eq(&self, other: &Self) -> bool {
-        self.deref().eq(other.deref())
+        // equal pointer means same interner and same contents
+        self.0 == other.0 || self.deref().eq(other.deref())
     }
 }
 impl<T: ?Sized + std::cmp::Ord> Eq for InternedOrd<T> where T: Eq {}
@@ -227,12 +247,18 @@ impl<T: ?Sized + std::cmp::Ord> PartialOrd for InternedOrd<T>
 where
     T: PartialOrd,
 {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        if self.0 == other.0 {
+            return Some(Ordering::Equal);
+        }
         self.deref().partial_cmp(other.deref())
     }
 }
 impl<T: ?Sized + std::cmp::Ord> std::cmp::Ord for InternedOrd<T> {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+    fn cmp(&self, other: &Self) -> Ordering {
+        if self.0 == other.0 {
+            return Ordering::Equal;
+        }
         self.deref().cmp(other.deref())
     }
 }
@@ -288,6 +314,12 @@ impl<T: ?Sized + std::cmp::Ord> Pointer for InternedOrd<T> {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         Pointer::fmt(&(&**self as *const T), f)
     }
+}
+
+#[test]
+fn size() {
+    let s = std::mem::size_of::<Ord<()>>();
+    assert!(s < 100, "too big: {}", s);
 }
 
 #[cfg(all(test, loom))]
