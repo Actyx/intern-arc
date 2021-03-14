@@ -15,20 +15,33 @@
  */
 use crate::{
     loom::*,
-    ref_count::{Interned, RemovePtr},
+    ref_count::{Interned, Interner},
 };
 use std::{
     borrow::Borrow,
+    cmp::Ordering,
     collections::HashSet,
-    hash::Hash,
-    sync::{Arc, Weak},
+    fmt::{Debug, Display, Formatter, Pointer},
+    hash::Hasher,
+    ops::Deref,
+    sync::Arc,
 };
 
-pub struct HashInterner<T: ?Sized> {
-    inner: Arc<Inner<T>>,
+/// Interner for hashable values
+///
+/// The interner is cheaply cloneable by virtue of keeping the underlying storage
+/// in an [`Arc`](https://doc.rust-lang.org/std/sync/struct.Arc.html). Once the last
+/// reference to this interner is dropped, it will clear its backing storage and
+/// release all references to the interned values it has created that are still live.
+/// Those values remain fully operational until dropped. Memory for the values
+/// themselves is freed for each value individually once its last reference is dropped.
+/// The interner’s ArcInner memory will only be deallocated once the last interned
+/// value has been dropped (this is less than hundred bytes).
+pub struct HashInterner<T: ?Sized + Eq + std::hash::Hash> {
+    inner: Arc<Hash<T>>,
 }
 
-impl<T: ?Sized> Clone for HashInterner<T> {
+impl<T: ?Sized + Eq + std::hash::Hash> Clone for HashInterner<T> {
     fn clone(&self) -> Self {
         Self {
             inner: self.inner.clone(),
@@ -37,9 +50,8 @@ impl<T: ?Sized> Clone for HashInterner<T> {
 }
 
 #[repr(C)]
-struct Inner<T: ?Sized> {
-    remover: RemovePtr<T>,
-    set: RwLock<HashSet<Interned<T>>>,
+pub struct Hash<T: ?Sized + Eq + std::hash::Hash> {
+    set: RwLock<HashSet<InternedHash<T>>>,
 }
 
 #[cfg(loom)]
@@ -51,40 +63,34 @@ impl<T: ?Sized> Drop for Inner<T> {
     }
 }
 
-unsafe impl<T: ?Sized + Sync + Send> Send for Inner<T> {}
-unsafe impl<T: ?Sized + Sync + Send> Sync for Inner<T> {}
+unsafe impl<T: ?Sized + Eq + std::hash::Hash + Sync + Send> Send for Hash<T> {}
+unsafe impl<T: ?Sized + Eq + std::hash::Hash + Sync + Send> Sync for Hash<T> {}
 
-fn remover<T: ?Sized + Eq + Hash>(this: *const (), key: *const Interned<T>) {
-    // this is safe because we’re still holding a weak reference: the value may be dropped
-    // but the ArcInner is still alive!
-    let weak = unsafe { Weak::from_raw(this as *const Inner<T>) };
-    if let Some(strong) = weak.upgrade() {
-        let mut set = strong.set.write();
+impl<T: ?Sized + Eq + std::hash::Hash> Interner for Hash<T> {
+    type T = T;
+
+    fn remove(&self, value: &Interned<Self>) -> (bool, Option<Interned<Self>>) {
+        let value = cast(value);
+        let mut set = self.set.write();
         #[cfg(loom)]
         let mut set = set.unwrap();
-        // need to bind the return value so that the map’s lock is released
-        // before the value is dropped
-        // Please see Interned::drop() for an explanation why `key` is safe in this case
-        let value = set.take(unsafe { &*key });
-        drop(set);
-        // drop value outside the lock
-        drop(value);
+        if let Some(i) = set.take(value) {
+            if i.ref_count() == 1 {
+                (true, Some(i.0))
+            } else {
+                set.insert(i);
+                (false, None)
+            }
+        } else {
+            (true, None)
+        }
     }
 }
 
-/// Interner for hashable values
-///
-/// The interner is cheaply cloneable by virtue of keeping the underlying storage
-/// in an [`Arc`](https://doc.rust-lang.org/std/sync/struct.Arc.html). Once the last
-/// reference to this interner is dropped, it will clear its backing storage and
-/// release all references to the interned values it has created that are still live.
-/// Those values remain fully operational until dropped. Memory for the values
-/// themselves is freed for each value individually once its last reference is dropped.
-impl<T: ?Sized + Eq + Hash> HashInterner<T> {
+impl<T: ?Sized + Eq + std::hash::Hash> HashInterner<T> {
     pub fn new() -> Self {
         Self {
-            inner: Arc::new(Inner {
-                remover,
+            inner: Arc::new(Hash {
                 set: RwLock::new(HashSet::new()),
             }),
         }
@@ -106,9 +112,9 @@ impl<T: ?Sized + Eq + Hash> HashInterner<T> {
         set.is_empty()
     }
 
-    fn intern<U, F>(&self, value: U, intern: F) -> Interned<T>
+    fn intern<U, F>(&self, value: U, intern: F) -> InternedHash<T>
     where
-        F: FnOnce(U) -> Interned<T>,
+        F: FnOnce(U) -> InternedHash<T>,
         U: Borrow<T>,
     {
         #[cfg(not(loom))]
@@ -130,8 +136,7 @@ impl<T: ?Sized + Eq + Hash> HashInterner<T> {
             return entry.clone();
         }
         let mut ret = intern(value);
-        let me = Weak::into_raw(Arc::downgrade(&self.inner));
-        ret.make_hot(me as *mut RemovePtr<T>);
+        ret.0.make_hot(&self.inner);
         set.insert(ret.clone());
         ret
     }
@@ -139,52 +144,198 @@ impl<T: ?Sized + Eq + Hash> HashInterner<T> {
     /// Intern a value from a shared reference by allocating new memory for it.
     ///
     /// ```
-    /// use intern_arc::{HashInterner, Interned};
+    /// use intern_arc::{HashInterner, InternedHash};
     ///
     /// let strings = HashInterner::<str>::new();
-    /// let i: Interned<str> = strings.intern_ref("hello world!");
+    /// let i: InternedHash<str> = strings.intern_ref("hello world!");
     /// ```
-    pub fn intern_ref(&self, value: &T) -> Interned<T>
+    pub fn intern_ref(&self, value: &T) -> InternedHash<T>
     where
         T: ToOwned,
         T::Owned: Into<Box<T>>,
     {
-        self.intern(value, |v| Interned::from_box(v.to_owned().into()))
+        self.intern(value, |v| {
+            InternedHash(Interned::from_box(v.to_owned().into()))
+        })
     }
 
     /// Intern a value from an owned reference without allocating new memory for it.
     ///
     /// ```
-    /// use intern_arc::{HashInterner, Interned};
+    /// use intern_arc::{HashInterner, InternedHash};
     ///
     /// let strings = HashInterner::<str>::new();
     /// let hello: Box<str> = "hello world!".into();
-    /// let i: Interned<str> = strings.intern_box(hello);
+    /// let i: InternedHash<str> = strings.intern_box(hello);
     /// ```
     /// (This also works nicely with a `String` that can be turned `.into()` a `Box`.)
-    pub fn intern_box(&self, value: Box<T>) -> Interned<T> {
-        self.intern(value, Interned::from_box)
+    pub fn intern_box(&self, value: Box<T>) -> InternedHash<T> {
+        self.intern(value, |v| InternedHash(Interned::from_box(v)))
     }
 
     /// Intern a sized value, allocating heap memory for it.
     ///
     /// ```
-    /// use intern_arc::{HashInterner, Interned};
+    /// use intern_arc::{HashInterner, InternedHash};
     ///
     /// let arrays = HashInterner::<[u8; 1000]>::new();
-    /// let i: Interned<[u8; 1000]> = arrays.intern_sized([0; 1000]);
-    pub fn intern_sized(&self, value: T) -> Interned<T>
+    /// let i: InternedHash<[u8; 1000]> = arrays.intern_sized([0; 1000]);
+    pub fn intern_sized(&self, value: T) -> InternedHash<T>
     where
         T: Sized,
     {
-        self.intern(value, Interned::from_sized)
+        self.intern(value, |v| InternedHash(Interned::from_sized(v)))
     }
 }
 
-impl<T: ?Sized + Eq + Hash> Default for HashInterner<T> {
+impl<T: ?Sized + Eq + std::hash::Hash> Default for HashInterner<T> {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// An interned value
+///
+/// This type works very similar to an [`Arc`](https://doc.rust-lang.org/std/sync/struct.Arc.html)
+/// with the difference that it has no concept of weak references. They are not needed because
+/// **interned values must not be modified**, so reference cycles cannot be constructed. One
+/// reference is held by the interner that created this value as long as that interner lives.
+///
+/// Keeping interned values around does not keep the interner alive: once the last reference to
+/// the interner is dropped, it will release its existing references to interned values by
+/// dropping its set implementation. Only the direct allocation size of the set implementation
+/// remains allocated (but no longer functional) until the last weak reference to the interner
+/// goes away — each interned value keeps one such weak reference to its interner.
+#[repr(transparent)] // this is important to cast references
+pub struct InternedHash<T: ?Sized + Eq + std::hash::Hash>(Interned<Hash<T>>);
+
+impl<T: ?Sized + Eq + std::hash::Hash> InternedHash<T> {
+    /// Obtain current number of references, including this one.
+    ///
+    /// The value will always be at least 1. If the value is 1, this means that the interner
+    /// which produced this reference has been dropped; in this case you are still free to
+    /// use this reference in any way you like.
+    pub fn ref_count(&self) -> u32 {
+        self.0.ref_count()
+    }
+}
+
+impl<T: ?Sized + Eq + std::hash::Hash> Clone for InternedHash<T> {
+    fn clone(&self) -> Self {
+        Self(self.0.clone())
+    }
+}
+
+fn cast<T: ?Sized + Eq + std::hash::Hash>(i: &Interned<Hash<T>>) -> &InternedHash<T> {
+    // since the memory representation of InternedHash<T> is exactly the same as
+    // Interned<Hash<T>>, we can turn a pointer to one into a pointer to the other
+    unsafe { &*(i as *const _ as *const InternedHash<T>) }
+}
+
+impl<T: ?Sized + Eq + std::hash::Hash> PartialEq for InternedHash<T>
+where
+    T: PartialEq,
+{
+    fn eq(&self, other: &Self) -> bool {
+        // equal pointer means same interner and same contents
+        self.0 == other.0 || self.deref().eq(other.deref())
+    }
+}
+impl<T: ?Sized + Eq + std::hash::Hash> Eq for InternedHash<T> where T: Eq {}
+
+impl<T: ?Sized + Eq + std::hash::Hash> PartialOrd for InternedHash<T>
+where
+    T: PartialOrd,
+{
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        if self.0 == other.0 {
+            return Some(Ordering::Equal);
+        }
+        self.deref().partial_cmp(other.deref())
+    }
+}
+impl<T: ?Sized + Eq + std::hash::Hash> Ord for InternedHash<T>
+where
+    T: Ord,
+{
+    fn cmp(&self, other: &Self) -> Ordering {
+        if self.0 == other.0 {
+            return Ordering::Equal;
+        }
+        self.deref().cmp(other.deref())
+    }
+}
+
+impl<T: ?Sized + Eq + std::hash::Hash> std::hash::Hash for InternedHash<T>
+where
+    T: std::hash::Hash,
+{
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.deref().hash(state)
+    }
+}
+
+impl<T: ?Sized + Eq + std::hash::Hash> Borrow<T> for InternedHash<T> {
+    fn borrow(&self) -> &T {
+        self.deref()
+    }
+}
+
+impl<T: ?Sized + Eq + std::hash::Hash> Deref for InternedHash<T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        self.0.deref()
+    }
+}
+
+impl<T: ?Sized + Eq + std::hash::Hash> AsRef<T> for InternedHash<T> {
+    fn as_ref(&self) -> &T {
+        self.deref()
+    }
+}
+
+impl<T: ?Sized + Eq + std::hash::Hash> Debug for InternedHash<T>
+where
+    T: Debug,
+{
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Interned({:?})", &*self)
+    }
+}
+
+impl<T: ?Sized + Eq + std::hash::Hash> Display for InternedHash<T>
+where
+    T: Display,
+{
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        self.deref().fmt(f)
+    }
+}
+
+impl<T: ?Sized + Eq + std::hash::Hash> Pointer for InternedHash<T> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        Pointer::fmt(&(&**self as *const T), f)
+    }
+}
+
+#[cfg(all(test, not(loom)))]
+mod tests {
+    use crate::OrdInterner;
+
+    #[test]
+    fn pointer() {
+        let interner = OrdInterner::new();
+        let i = interner.intern_sized(42);
+        let i2 = i.clone();
+        assert_eq!(format!("{:p}", i), format!("{:p}", i2));
+    }
+}
+
+#[test]
+fn size() {
+    let s = std::mem::size_of::<Hash<()>>();
+    assert!(s < 100, "too big: {}", s);
 }
 
 #[cfg(all(test, loom))]

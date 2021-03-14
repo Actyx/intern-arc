@@ -15,19 +15,33 @@
  */
 use crate::{
     loom::*,
-    ref_count::{Interned, RemovePtr},
+    ref_count::{Interned, Interner},
 };
 use std::{
     borrow::Borrow,
+    cmp::Ordering,
     collections::BTreeSet,
-    sync::{Arc, Weak},
+    fmt::{Debug, Display, Formatter, Pointer},
+    hash::Hasher,
+    ops::Deref,
+    sync::Arc,
 };
 
-pub struct OrdInterner<T: ?Sized> {
-    inner: Arc<Inner<T>>,
+/// Interner for values with a total order
+///
+/// The interner is cheaply cloneable by virtue of keeping the underlying storage
+/// in an [`Arc`](https://doc.rust-lang.org/std/sync/struct.Arc.html). Once the last
+/// reference to this interner is dropped, it will clear its backing storage and
+/// release all references to the interned values it has created that are still live.
+/// Those values remain fully operational until dropped. Memory for the values
+/// themselves is freed for each value individually once its last reference is dropped.
+/// The interner’s ArcInner memory will only be deallocated once the last interned
+/// value has been dropped (this is less than hundred bytes).
+pub struct OrdInterner<T: ?Sized + std::cmp::Ord> {
+    inner: Arc<Ord<T>>,
 }
 
-impl<T: ?Sized> Clone for OrdInterner<T> {
+impl<T: ?Sized + std::cmp::Ord> Clone for OrdInterner<T> {
     fn clone(&self) -> Self {
         Self {
             inner: self.inner.clone(),
@@ -36,9 +50,8 @@ impl<T: ?Sized> Clone for OrdInterner<T> {
 }
 
 #[repr(C)]
-struct Inner<T: ?Sized> {
-    remover: RemovePtr<T>,
-    set: RwLock<BTreeSet<Interned<T>>>,
+pub struct Ord<T: ?Sized + std::cmp::Ord> {
+    set: RwLock<BTreeSet<InternedOrd<T>>>,
 }
 
 #[cfg(loom)]
@@ -50,38 +63,34 @@ impl<T: ?Sized> Drop for Inner<T> {
     }
 }
 
-unsafe impl<T: ?Sized + Sync + Send> Send for Inner<T> {}
-unsafe impl<T: ?Sized + Sync + Send> Sync for Inner<T> {}
+unsafe impl<T: ?Sized + std::cmp::Ord + Sync + Send> Send for Ord<T> {}
+unsafe impl<T: ?Sized + std::cmp::Ord + Sync + Send> Sync for Ord<T> {}
 
-fn remover<T: ?Sized + Ord>(this: *const (), key: *const Interned<T>) {
-    // this is safe because we’re still holding a weak reference: the value may be dropped
-    // but the ArcInner is still alive!
-    let weak = unsafe { Weak::from_raw(this as *const Inner<T>) };
-    if let Some(strong) = weak.upgrade() {
-        let mut set = strong.set.write();
+impl<T: ?Sized + std::cmp::Ord> Interner for Ord<T> {
+    type T = T;
+
+    fn remove(&self, value: &Interned<Self>) -> (bool, Option<Interned<Self>>) {
+        let value = cast(value);
+        let mut set = self.set.write();
         #[cfg(loom)]
         let mut set = set.unwrap();
-        // Please see Interned::drop() for an explanation why `key` is safe in this case
-        let value = set.take(unsafe { &*key });
-        drop(set);
-        // drop the value outside the lock
-        drop(value);
+        if let Some(i) = set.take(value) {
+            if i.ref_count() == 1 {
+                (true, Some(i.0))
+            } else {
+                set.insert(i);
+                (false, None)
+            }
+        } else {
+            (true, None)
+        }
     }
 }
 
-/// Interner for values with a total order
-///
-/// The interner is cheaply cloneable by virtue of keeping the underlying storage
-/// in an [`Arc`](https://doc.rust-lang.org/std/sync/struct.Arc.html). Once the last
-/// reference to this interner is dropped, it will clear its backing storage and
-/// release all references to the interned values it has created that are still live.
-/// Those values remain fully operational until dropped. Memory for the values
-/// themselves is freed for each value individually once its last reference is dropped.
-impl<T: ?Sized + Ord> OrdInterner<T> {
+impl<T: ?Sized + std::cmp::Ord> OrdInterner<T> {
     pub fn new() -> Self {
         Self {
-            inner: Arc::new(Inner {
-                remover,
+            inner: Arc::new(Ord {
                 set: RwLock::new(BTreeSet::new()),
             }),
         }
@@ -103,9 +112,9 @@ impl<T: ?Sized + Ord> OrdInterner<T> {
         set.is_empty()
     }
 
-    fn intern<U, F>(&self, value: U, intern: F) -> Interned<T>
+    fn intern<U, F>(&self, value: U, intern: F) -> InternedOrd<T>
     where
-        F: FnOnce(U) -> Interned<T>,
+        F: FnOnce(U) -> InternedOrd<T>,
         U: Borrow<T>,
     {
         #[cfg(not(loom))]
@@ -127,8 +136,7 @@ impl<T: ?Sized + Ord> OrdInterner<T> {
             return entry.clone();
         }
         let mut ret = intern(value);
-        let me = Weak::into_raw(Arc::downgrade(&self.inner));
-        ret.make_hot(me as *mut RemovePtr<T>);
+        ret.0.make_hot(&self.inner);
         set.insert(ret.clone());
         ret
     }
@@ -136,52 +144,182 @@ impl<T: ?Sized + Ord> OrdInterner<T> {
     /// Intern a value from a shared reference by allocating new memory for it.
     ///
     /// ```
-    /// use intern_arc::{OrdInterner, Interned};
+    /// use intern_arc::{OrdInterner, InternedOrd};
     ///
     /// let strings = OrdInterner::<str>::new();
-    /// let i: Interned<str> = strings.intern_ref("hello world!");
+    /// let i: InternedOrd<str> = strings.intern_ref("hello world!");
     /// ```
-    pub fn intern_ref(&self, value: &T) -> Interned<T>
+    pub fn intern_ref(&self, value: &T) -> InternedOrd<T>
     where
         T: ToOwned,
         T::Owned: Into<Box<T>>,
     {
-        self.intern(value, |v| Interned::from_box(v.to_owned().into()))
+        self.intern(value, |v| {
+            InternedOrd(Interned::from_box(v.to_owned().into()))
+        })
     }
 
     /// Intern a value from an owned reference without allocating new memory for it.
     ///
     /// ```
-    /// use intern_arc::{OrdInterner, Interned};
+    /// use intern_arc::{OrdInterner, InternedOrd};
     ///
     /// let strings = OrdInterner::<str>::new();
     /// let hello: Box<str> = "hello world!".into();
-    /// let i: Interned<str> = strings.intern_box(hello);
+    /// let i: InternedOrd<str> = strings.intern_box(hello);
     /// ```
     /// (This also works nicely with a `String` that can be turned `.into()` a `Box`.)
-    pub fn intern_box(&self, value: Box<T>) -> Interned<T> {
-        self.intern(value, Interned::from_box)
+    pub fn intern_box(&self, value: Box<T>) -> InternedOrd<T> {
+        self.intern(value, |v| InternedOrd(Interned::from_box(v)))
     }
 
     /// Intern a sized value, allocating heap memory for it.
     ///
     /// ```
-    /// use intern_arc::{OrdInterner, Interned};
+    /// use intern_arc::{OrdInterner, InternedOrd};
     ///
     /// let arrays = OrdInterner::<[u8; 1000]>::new();
-    /// let i: Interned<[u8; 1000]> = arrays.intern_sized([0; 1000]);
-    pub fn intern_sized(&self, value: T) -> Interned<T>
+    /// let i: InternedOrd<[u8; 1000]> = arrays.intern_sized([0; 1000]);
+    pub fn intern_sized(&self, value: T) -> InternedOrd<T>
     where
         T: Sized,
     {
-        self.intern(value, Interned::from_sized)
+        self.intern(value, |v| InternedOrd(Interned::from_sized(v)))
     }
 }
 
-impl<T: ?Sized + Ord> Default for OrdInterner<T> {
+impl<T: ?Sized + std::cmp::Ord> Default for OrdInterner<T> {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// An interned value
+///
+/// This type works very similar to an [`Arc`](https://doc.rust-lang.org/std/sync/struct.Arc.html)
+/// with the difference that it has no concept of weak references. They are not needed because
+/// **interned values must not be modified**, so reference cycles cannot be constructed. One
+/// reference is held by the interner that created this value as long as that interner lives.
+///
+/// Keeping interned values around does not keep the interner alive: once the last reference to
+/// the interner is dropped, it will release its existing references to interned values by
+/// dropping its set implementation. Only the direct allocation size of the set implementation
+/// remains allocated (but no longer functional) until the last weak reference to the interner
+/// goes away — each interned value keeps one such weak reference to its interner.
+#[repr(transparent)] // this is important to cast references
+pub struct InternedOrd<T: ?Sized + std::cmp::Ord>(Interned<Ord<T>>);
+
+impl<T: ?Sized + std::cmp::Ord> InternedOrd<T> {
+    /// Obtain current number of references, including this one.
+    ///
+    /// The value will always be at least 1. If the value is 1, this means that the interner
+    /// which produced this reference has been dropped; in this case you are still free to
+    /// use this reference in any way you like.
+    pub fn ref_count(&self) -> u32 {
+        self.0.ref_count()
+    }
+}
+
+impl<T: ?Sized + std::cmp::Ord> Clone for InternedOrd<T> {
+    fn clone(&self) -> Self {
+        Self(self.0.clone())
+    }
+}
+
+fn cast<T: ?Sized + std::cmp::Ord>(i: &Interned<Ord<T>>) -> &InternedOrd<T> {
+    // since the memory representation of InternedOrd<T> is exactly the same as
+    // Interned<Ord<T>>, we can turn a pointer to one into a pointer to the other
+    unsafe { &*(i as *const _ as *const InternedOrd<T>) }
+}
+
+impl<T: ?Sized + std::cmp::Ord> PartialEq for InternedOrd<T>
+where
+    T: PartialEq,
+{
+    fn eq(&self, other: &Self) -> bool {
+        // equal pointer means same interner and same contents
+        self.0 == other.0 || self.deref().eq(other.deref())
+    }
+}
+impl<T: ?Sized + std::cmp::Ord> Eq for InternedOrd<T> where T: Eq {}
+
+impl<T: ?Sized + std::cmp::Ord> PartialOrd for InternedOrd<T>
+where
+    T: PartialOrd,
+{
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        if self.0 == other.0 {
+            return Some(Ordering::Equal);
+        }
+        self.deref().partial_cmp(other.deref())
+    }
+}
+impl<T: ?Sized + std::cmp::Ord> std::cmp::Ord for InternedOrd<T> {
+    fn cmp(&self, other: &Self) -> Ordering {
+        if self.0 == other.0 {
+            return Ordering::Equal;
+        }
+        self.deref().cmp(other.deref())
+    }
+}
+
+impl<T: ?Sized + std::cmp::Ord> std::hash::Hash for InternedOrd<T>
+where
+    T: std::hash::Hash,
+{
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.deref().hash(state)
+    }
+}
+
+impl<T: ?Sized + std::cmp::Ord> Borrow<T> for InternedOrd<T> {
+    fn borrow(&self) -> &T {
+        self.deref()
+    }
+}
+
+impl<T: ?Sized + std::cmp::Ord> Deref for InternedOrd<T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        self.0.deref()
+    }
+}
+
+impl<T: ?Sized + std::cmp::Ord> AsRef<T> for InternedOrd<T> {
+    fn as_ref(&self) -> &T {
+        self.deref()
+    }
+}
+
+impl<T: ?Sized + std::cmp::Ord> Debug for InternedOrd<T>
+where
+    T: Debug,
+{
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Interned({:?})", &*self)
+    }
+}
+
+impl<T: ?Sized + std::cmp::Ord> Display for InternedOrd<T>
+where
+    T: Display,
+{
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        self.deref().fmt(f)
+    }
+}
+
+impl<T: ?Sized + std::cmp::Ord> Pointer for InternedOrd<T> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        Pointer::fmt(&(&**self as *const T), f)
+    }
+}
+
+#[test]
+fn size() {
+    let s = std::mem::size_of::<Ord<()>>();
+    assert!(s < 100, "too big: {}", s);
 }
 
 #[cfg(all(test, loom))]

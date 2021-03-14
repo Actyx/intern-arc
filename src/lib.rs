@@ -19,18 +19,21 @@
 //! (which served as initial inspiration) in that
 //!
 //!  - interners must be created and can be dropped (for convenience functions see below)
-//!  - it does not dispatch based on TypeId (each interner is for exactly one type)
+//!  - it does not dispatch based on [`TypeId`](https://doc.rust-lang.org/std/any/struct.TypeId.html)
+//!    (each interner is for exactly one type)
 //!  - it offers both [`Hash`](https://doc.rust-lang.org/std/hash/trait.Hash.html)-based
 //!    and [`Ord`](https://doc.rust-lang.org/std/cmp/trait.Ord.html)-based storage
-//!  - it handles unsized types without overhead, so you should use `Intern<str>` instead of `Intern<String>`
+//!  - it handles unsized types without overhead, so you should inline
+//!    [`str`](https://doc.rust-lang.org/std/primitive.str.html) instead of
+//!    [`String`](https://doc.rust-lang.org/std/string/struct.String.html)
 //!
 //! Unfortunately, this combination of features makes it inevitable to use unsafe Rust.
-//! The handling of reference counting and constructing of unsized values has been adapted
-//! from the standard library’s [`Arc`](https://doc.rust-lang.org/std/sync/struct.Arc.html) type.
-//! Additionally, the test suite passes also under [miri](https://github.com/rust-lang/miri) to
+//! The construction of unsized values has been adapted from the standard library’s
+//! [`Arc`](https://doc.rust-lang.org/std/sync/struct.Arc.html) type; reference counting
+//! employs a [`parking_lot`](https://docs.rs/parking_lot) mutex since it must also ensure
+//! consistent access to and usage of the cleanup function that will remove the value from its interner.
+//! The test suite passes also under [miri](https://github.com/rust-lang/miri) to
 //! check against some classes of undefined behavior in the unsafe code (including memory leaks).
-//! Dedicated tests are in place employing [`loom`](https://docs.rs/loom) to verify adherence
-//! to the Rust memory model.
 //!
 //! ## API flavors
 //!
@@ -57,33 +60,24 @@
 //! That said, this crate also provides convenience functions based on a global type-indexed pool:
 //!
 //! ```
-//! use intern_arc::{global::hash_interner, Interned};
+//! use intern_arc::{global::hash_interner};
 //!
-//! let i1 = hash_interner().intern_ref("hello"); // -> Interned<str>
-//! let i2 = hash_interner().intern_sized(vec![1, 2, 3]); // -> Interned<Vec<i32>>
+//! let i1 = hash_interner().intern_ref("hello"); // -> InternedHash<str>
+//! let i2 = hash_interner().intern_sized(vec![1, 2, 3]); // -> InternedHash<Vec<i32>>
 //! # use std::any::{Any, TypeId}; // using TypeId to avoid influencing type interence
-//! # assert_eq!(i1.type_id(), TypeId::of::<Interned<str>>());
-//! # assert_eq!(i2.type_id(), TypeId::of::<Interned<Vec<i32>>>());
+//! # use intern_arc::InternedHash;
+//! # assert_eq!(i1.type_id(), TypeId::of::<InternedHash<str>>());
+//! # assert_eq!(i2.type_id(), TypeId::of::<InternedHash<Vec<i32>>>());
 //! ```
 //!
 //! You can also use the type-indexed pool yourself to control its lifetime:
 //!
 //! ```
-//! use intern_arc::{global::OrdInternerPool, Interned};
+//! use intern_arc::{global::OrdInternerPool, InternedOrd};
 //!
 //! let mut pool = OrdInternerPool::new();
-//! let i: Interned<[u8]> = pool.get_or_create().intern_box(vec![1, 2, 3].into());
+//! let i: InternedOrd<[u8]> = pool.get_or_create().intern_box(vec![1, 2, 3].into());
 //! ```
-//!
-//! ## Caveat emptor!
-//!
-//! This crate’s [`Interned`](struct.Interned.html) type does not optimise equality using
-//! pointer comparisons because there is a race condition between dropping a value and
-//! interning that same value that will lead to “orphaned” instances (meaning that
-//! interning that same value again later will yield a different storage location).
-//! All similarly constructed interning implementations share this caveat (e.g.
-//! [`internment`](https://crates.io/crates/internment) or the above mentioned
-//! [`arc-interner`](https://crates.io/crates/arc-interner)).
 #![doc(html_logo_url = "https://developer.actyx.com/img/logo.svg")]
 #![doc(html_favicon_url = "https://developer.actyx.com/img/favicon.ico")]
 
@@ -92,22 +86,37 @@ mod hash;
 mod ref_count;
 mod tree;
 
-pub use hash::HashInterner;
-pub use ref_count::Interned;
-pub use tree::OrdInterner;
+pub use hash::{HashInterner, InternedHash};
+pub use tree::{InternedOrd, OrdInterner};
 
 #[cfg(loom)]
 mod loom {
-    pub use ::loom::alloc::{alloc, dealloc, Layout};
-    pub use ::loom::sync::atomic::{spin_loop_hint, AtomicPtr, AtomicUsize, Ordering::*};
-    pub use ::loom::sync::RwLock;
-    pub use ::loom::thread::{current, yield_now};
+    pub use ::loom::{
+        alloc::{alloc, dealloc, Layout},
+        sync::{
+            atomic::{spin_loop_hint, AtomicPtr, AtomicUsize, Ordering::*},
+            MutexGuard, RwLock,
+        },
+        thread::{current, yield_now},
+    };
+
+    pub struct Mutex<T>(::loom::sync::Mutex<T>);
+    impl<T> Mutex<T> {
+        pub fn new(t: T) -> Self {
+            Self(::loom::sync::Mutex::new(t))
+        }
+        pub fn lock(&self) -> MutexGuard<'_, T> {
+            self.0.lock().unwrap()
+        }
+    }
 }
 
 #[cfg(not(loom))]
 mod loom {
-    pub use parking_lot::{RwLock, RwLockUpgradableReadGuard};
-    pub use std::alloc::{alloc, dealloc, Layout};
-    pub use std::sync::atomic::{spin_loop_hint, AtomicPtr, AtomicUsize, Ordering::*};
-    pub use std::thread::{current, yield_now};
+    pub use parking_lot::{Mutex, MutexGuard, RwLock, RwLockUpgradableReadGuard};
+    pub use std::{
+        alloc::{alloc, dealloc, Layout},
+        sync::atomic::{spin_loop_hint, AtomicPtr, AtomicUsize, Ordering::*},
+        thread::{current, yield_now},
+    };
 }
