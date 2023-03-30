@@ -297,7 +297,7 @@ where
     T: Debug,
 {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Interned({:?})", &*self)
+        write!(f, "Interned({:?})", &**self)
     }
 }
 
@@ -320,6 +320,13 @@ impl<T: ?Sized + std::cmp::Ord> Pointer for InternedOrd<T> {
 fn size() {
     let s = std::mem::size_of::<Ord<()>>();
     assert!(s < 100, "too big: {}", s);
+}
+
+#[test]
+fn debug() {
+    let interner = OrdInterner::new();
+    let i = interner.intern_ref("value");
+    assert_eq!(format!("{i:?}"), r#"Interned("value")"#);
 }
 
 #[cfg(all(test, loom))]

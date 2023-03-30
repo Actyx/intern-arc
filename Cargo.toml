@@ -2,7 +2,7 @@
 name = "intern-arc"
 description = "An interner that deallocates unused values"
 homepage = "https://github.com/Actyx/intern-arc"
-version = "0.5.0"
+version = "0.5.1"
 authors = ["Actyx AG <developer@actyx.io>"]
 edition = "2018"
 license = "Apache-2.0 OR MIT"
