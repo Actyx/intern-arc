@@ -27,7 +27,7 @@ criterion = "0.4.0"
 quickcheck = "1.0.3"
 
 [target.'cfg(loom)'.dependencies]
-loom = "0.5.6"
+loom = "0.7.0"
 
 [features]
 # turns on println debugging, useful when miri has found a problem
