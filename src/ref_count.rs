@@ -62,7 +62,7 @@ impl<I: Interner> State<I> {
             cleanup: UnsafeCell::new(None),
         }
     }
-    pub fn lock(&self) -> Guard<I> {
+    pub fn lock(&self) -> Guard<'_, I> {
         self.mutex.lock();
         Guard(self)
     }
@@ -166,7 +166,7 @@ impl<I: Interner> Interned<I> {
         self.lock().refs()
     }
 
-    fn lock(&self) -> Guard<I> {
+    fn lock(&self) -> Guard<'_, I> {
         // this is safe since the existence of &self proves that the pointer is still valid
         unsafe { self.inner.as_ref().state.lock() }
     }
@@ -320,7 +320,7 @@ impl<I: Interner> Drop for Interned<I> {
             drop(state);
 
             // since we created the pointer with Box::leak(), we can recreate the box to drop it
-            unsafe { Box::from_raw(self.inner.as_ptr()) };
+            drop(unsafe { Box::from_raw(self.inner.as_ptr()) });
         }
 
         #[cfg(feature = "println")]

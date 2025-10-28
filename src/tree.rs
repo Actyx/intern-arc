@@ -316,6 +316,55 @@ impl<T: ?Sized + std::cmp::Ord> Pointer for InternedOrd<T> {
     }
 }
 
+#[cfg(feature = "serde")]
+impl<T: ?Sized + std::cmp::Ord + serde::Serialize> serde::Serialize for InternedOrd<T> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        (**self).serialize(serializer)
+    }
+}
+
+#[cfg(feature = "serde")]
+impl<'de, T> serde::Deserialize<'de> for InternedOrd<T>
+where
+    T: std::cmp::Ord + serde::Deserialize<'de> + Send + Sync + 'static,
+{
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = T::deserialize(deserializer)?;
+        Ok(crate::global::ord_interner().intern_sized(value))
+    }
+}
+
+#[cfg(feature = "serde")]
+impl<'de, T> serde::Deserialize<'de> for InternedOrd<[T]>
+where
+    T: std::cmp::Ord + serde::Deserialize<'de> + Send + Sync + 'static,
+{
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = Vec::<T>::deserialize(deserializer)?;
+        Ok(crate::global::ord_interner().intern_box(value.into()))
+    }
+}
+
+#[cfg(feature = "serde")]
+impl<'de> serde::Deserialize<'de> for InternedOrd<str> {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Ok(crate::global::ord_interner().intern_box(value.into()))
+    }
+}
+
 #[test]
 fn size() {
     let s = std::mem::size_of::<Ord<()>>();

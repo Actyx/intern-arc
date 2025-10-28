@@ -2,8 +2,8 @@
 name = "intern-arc"
 description = "An interner that deallocates unused values"
 homepage = "https://github.com/Actyx/intern-arc"
-version = "0.6.1"
-authors = ["Actyx AG <developer@actyx.io>"]
+version = "0.6.2"
+authors = ["Roland Kuhn <rk@rkuhn.info>"]
 edition = "2018"
 license = "Apache-2.0 OR MIT"
 readme = "README.md"
@@ -13,6 +13,7 @@ keywords = ["intern", "interner", "interning"]
 [dependencies]
 once_cell = { version = "1.17.1", features = ["parking_lot"] }
 parking_lot = "0.12.1"
+serde = { version = "1.0", optional = true }
 
 [profile.bench]
 lto = false

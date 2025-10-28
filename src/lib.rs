@@ -80,6 +80,7 @@
 //! ```
 #![doc(html_logo_url = "https://developer.actyx.com/img/logo.svg")]
 #![doc(html_favicon_url = "https://developer.actyx.com/img/favicon.ico")]
+#![allow(unexpected_cfgs)]
 
 pub mod global;
 mod hash;
@@ -112,6 +113,7 @@ mod loom {
 }
 
 #[cfg(not(loom))]
+#[allow(unused_imports, deprecated)]
 mod loom {
     pub use parking_lot::{Mutex, MutexGuard, RwLock, RwLockUpgradableReadGuard};
     pub use std::{
